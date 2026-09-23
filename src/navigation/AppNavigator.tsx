@@ -2,21 +2,18 @@ import React from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useAuth } from '../context/AuthContext';
-import { useTenant } from '../context/TenantContext';
 import { AuthNavigator } from './AuthNavigator';
 import { RoleNavigator } from './RoleNavigator';
-import { TenantSelectionScreen } from '../screens/auth/TenantSelectionScreen';
 import { SuspensionGuard } from '../components/common/SuspensionGuard';
 import { ActivityIndicator, View, StyleSheet } from 'react-native';
 
 const Stack = createNativeStackNavigator();
 
 export const AppNavigator: React.FC = () => {
-  const { user, isLoading: authLoading } = useAuth();
-  const { tenant, isLoading: tenantLoading } = useTenant();
+  const { user, isLoading } = useAuth();
 
-  // Show loading screen while checking auth and tenant
-  if (authLoading || tenantLoading) {
+  // Show loading while auth state is being restored
+  if (isLoading) {
     return (
       <View style={styles.loadingContainer}>
         <ActivityIndicator size="large" color="#10b981" />
@@ -32,13 +29,10 @@ export const AppNavigator: React.FC = () => {
         }}
       >
         {!user ? (
-          // Not logged in
+          // Not logged in → Login screen
           <Stack.Screen name="Auth" component={AuthNavigator} />
-        ) : !tenant ? (
-          // Logged in but no tenant selected
-          <Stack.Screen name="TenantSelection" component={TenantSelectionScreen} />
         ) : (
-          // Logged in and tenant selected
+          // Logged in → Role-based navigator
           <Stack.Screen name="Main">
             {() => (
               <SuspensionGuard>

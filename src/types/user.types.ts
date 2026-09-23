@@ -17,6 +17,7 @@ export interface User {
   associatedStudent?: string;
   associatedTeacher?: string;
   associatedParent?: string;
+  associatedId?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -37,12 +38,21 @@ export interface AuthState {
 }
 
 export interface LoginCredentials {
-  username: string;
+  username: string;   
+  phone?: string;   
   password: string;
+}
+
+export interface TenantInfo {
+  tenantId: string;
+  schoolName: string;
+  subdomain: string;
+  location?: string;
 }
 
 export interface LoginResponse {
   message: string;
   token: string;
   user: User;
+  tenant?: TenantInfo;
 }

@@ -27,5 +27,5 @@ export const ROLE_DISPLAY_NAMES = {
   [ROLES.PARENT]: 'Parent',
 };
 
-export const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'http://159.65.102.14:7000/api';
+export const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'https://hufaad.com/api';
 export const SUPER_ADMIN_KEY = process.env.EXPO_PUBLIC_SUPER_ADMIN_KEY || 'muscab2004';

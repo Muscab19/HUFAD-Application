@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { Tenant, TenantState } from '../types/tenant.types';
+import { TenantState } from '../types/tenant.types';
 import { storage } from '../utils/storage';
-import { api } from '../api/client';
+import { useAuth } from './AuthContext';
 
 const initialState: TenantState = {
   tenant: null,
@@ -12,10 +12,7 @@ const initialState: TenantState = {
 };
 
 interface TenantContextType extends TenantState {
-  setTenant: (tenantId: string, subdomain: string) => Promise<void>;
-  setTenantBySubdomain: (subdomain: string) => Promise<void>;
   clearTenant: () => Promise<void>;
-  getTenantDetails: (tenantId: string) => Promise<Tenant>;
   refreshTenant: () => Promise<void>;
 }
 
@@ -23,38 +20,30 @@ const TenantContext = createContext<TenantContextType | undefined>(undefined);
 
 export const TenantProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [state, setState] = useState<TenantState>(initialState);
+  const { user } = useAuth();
 
-  // Load stored tenant data on mount
+  // Load tenant data from storage whenever user changes (login/logout)
   useEffect(() => {
-    const loadStoredData = async () => {
+    const loadTenant = async () => {
       try {
-        const [tenantId, tenantSubdomain] = await Promise.all([
+        const [tenantId, tenantSubdomain, tenantData] = await Promise.all([
           storage.getTenantId(),
           storage.getTenantSubdomain(),
+          storage.getTenantData(),
         ]);
 
         if (tenantId) {
-          // Try to get tenant details from API
-          try {
-            const tenant = await getTenantDetails(tenantId);
-            setState({
-              tenant,
+          setState({
+            tenant: tenantData || {
               tenantId,
-              tenantSubdomain: tenantSubdomain || tenant.subdomain,
-              isLoading: false,
-              error: null,
-            });
-          } catch (error) {
-            // If tenant not found, clear storage
-            await storage.clearTenant();
-            setState({
-              tenant: null,
-              tenantId: null,
-              tenantSubdomain: null,
-              isLoading: false,
-              error: 'Tenant not found',
-            });
-          }
+              subdomain: tenantSubdomain || '',
+              schoolName: tenantData?.schoolName || 'Your School',
+            } as any,
+            tenantId,
+            tenantSubdomain: tenantSubdomain || '',
+            isLoading: false,
+            error: null,
+          });
         } else {
           setState({
             ...initialState,
@@ -70,88 +59,8 @@ export const TenantProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
     };
 
-    loadStoredData();
-  }, []);
-
-  const getTenantDetails = useCallback(async (tenantId: string): Promise<Tenant> => {
-    try {
-      // Use the super admin endpoint to get tenant details
-      const response = await api.get<{ data: Tenant[] }>('/api/super/tenants');
-      const tenants = response.data || [];
-      const tenant = tenants.find((t: Tenant) => t._id === tenantId);
-      
-      if (!tenant) {
-        throw new Error('Tenant not found');
-      }
-      return tenant;
-    } catch (error) {
-      console.error('Failed to get tenant details:', error);
-      throw new Error('Failed to load tenant details');
-    }
-  }, []);
-
-  const setTenant = useCallback(async (tenantId: string, subdomain: string) => {
-    try {
-      setState(prev => ({ ...prev, isLoading: true }));
-      
-      const tenant = await getTenantDetails(tenantId);
-      
-      await Promise.all([
-        storage.storeTenantId(tenantId),
-        storage.storeTenantSubdomain(subdomain),
-      ]);
-      
-      setState({
-        tenant,
-        tenantId,
-        tenantSubdomain: subdomain,
-        isLoading: false,
-        error: null,
-      });
-    } catch (error: any) {
-      setState(prev => ({
-        ...prev,
-        isLoading: false,
-        error: error.message || 'Failed to set tenant',
-      }));
-      throw error;
-    }
-  }, [getTenantDetails]);
-
-  const setTenantBySubdomain = useCallback(async (subdomain: string) => {
-    try {
-      setState(prev => ({ ...prev, isLoading: true }));
-      
-      // Find tenant by subdomain using super admin endpoint
-      const response = await api.get<{ data: Tenant[] }>('/api/super/tenants');
-      const tenants = response.data || [];
-      const tenant = tenants.find((t: Tenant) => t.subdomain === subdomain.toLowerCase());
-      
-      if (!tenant) {
-        throw new Error(`School "${subdomain}" not found`);
-      }
-      
-      await Promise.all([
-        storage.storeTenantId(tenant._id),
-        storage.storeTenantSubdomain(tenant.subdomain),
-      ]);
-      
-      setState({
-        tenant,
-        tenantId: tenant._id,
-        tenantSubdomain: tenant.subdomain,
-        isLoading: false,
-        error: null,
-      });
-    } catch (error: any) {
-      setState(prev => ({
-        ...prev,
-        isLoading: false,
-        error: error.message || 'School not found',
-      }));
-      throw error;
-    }
-  }, []);
+    loadTenant();
+  }, [user?.tenantId]);
 
   const clearTenant = useCallback(async () => {
     await storage.clearTenant();
@@ -165,27 +74,20 @@ export const TenantProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   }, []);
 
   const refreshTenant = useCallback(async () => {
-    if (!state.tenantId) return;
-    
-    try {
-      const tenant = await getTenantDetails(state.tenantId);
+    const tenantData = await storage.getTenantData();
+    if (tenantData) {
       setState(prev => ({
         ...prev,
-        tenant,
+        tenant: tenantData,
       }));
-    } catch (error) {
-      console.error('Failed to refresh tenant:', error);
     }
-  }, [state.tenantId, getTenantDetails]);
+  }, []);
 
   return (
     <TenantContext.Provider
       value={{
         ...state,
-        setTenant,
-        setTenantBySubdomain,
         clearTenant,
-        getTenantDetails,
         refreshTenant,
       }}
     >
