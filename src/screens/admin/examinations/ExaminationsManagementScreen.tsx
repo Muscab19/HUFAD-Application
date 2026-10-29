@@ -1,5 +1,11 @@
 // src/screens/admin/examinations/ExaminationsManagementScreen.tsx
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  useRef,
+} from 'react';
 import {
   View,
   Text,
@@ -9,11 +15,9 @@ import {
   RefreshControl,
   ActivityIndicator,
   StyleSheet,
-  Modal,
   ScrollView,
   Alert,
-  Platform,
-  KeyboardAvoidingView,
+  Modal,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -21,20 +25,17 @@ import { useTranslation } from 'react-i18next';
 import {
   COLORS,
   Exam,
-  ExamFormType,
   ExamSettings,
   Halaqah,
   DEFAULT_EXAM_TYPES,
-  DEFAULT_COLUMNS,
-  DEFAULT_READING_HEADERS,
-  DEFAULT_READING_WEIGHTS,
   api,
   round2,
   getExamFormType,
-  getSurahName,
-  getJuzName,
 } from './_shared';
 import { ExamFormScreen } from './ExamFormScreen';
+import { ExamDetailsModal } from './ExamDetailsModal';
+import { ExamSettingsModal } from './ExamSettingsModal';
+import { printExamSheet, shareExamSheetAsPdf } from './PrintExamSheet';
 
 // ============================================================
 // ROOT
@@ -90,7 +91,7 @@ const ExamList: React.FC<{
   onEdit: (exam: Exam) => void;
   onCreate: () => void;
 }> = ({ settings, onSettingsChanged, onEdit, onCreate }) => {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [exams, setExams] = useState<Exam[]>([]);
   const [halaqat, setHalaqat] = useState<Halaqah[]>([]);
   const [examTypes, setExamTypes] = useState<string[]>(DEFAULT_EXAM_TYPES);
@@ -102,6 +103,7 @@ const ExamList: React.FC<{
   const [searchTerm, setSearchTerm] = useState('');
   const [filterType, setFilterType] = useState<string>('All');
   const [filterHalaqah, setFilterHalaqah] = useState<string>('all');
+  const [filterGender, setFilterGender] = useState<string>('all');
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [selectionMode, setSelectionMode] = useState(false);
@@ -111,12 +113,26 @@ const ExamList: React.FC<{
 
   const [settingsVisible, setSettingsVisible] = useState(false);
 
+  // ---- Filters bottom-sheet state ----
+  const [filtersVisible, setFiltersVisible] = useState(false);
+  const [filtersDraft, setFiltersDraft] = useState<{
+    examType: string;
+    halaqah: string;
+    gender: string;
+  }>({ examType: 'All', halaqah: 'all', gender: 'all' });
+
+  const language = i18n.language || 'en';
+
+  // ----------------------------------------------------------------
+  // Load
+  // ----------------------------------------------------------------
   const loadExams = useCallback(async () => {
     setError('');
     try {
       const list = await api.list({
         examType: filterType !== 'All' ? filterType : undefined,
         halaqah: filterHalaqah !== 'all' ? filterHalaqah : undefined,
+        gender: filterGender !== 'all' ? filterGender : undefined,
         searchQuery: searchTerm.trim() || undefined,
       });
       setExams(list);
@@ -125,12 +141,15 @@ const ExamList: React.FC<{
       setError(err?.message || t('examinations.loadFailed'));
       setExams([]);
     }
-  }, [filterType, filterHalaqah, searchTerm, t]);
+  }, [filterType, filterHalaqah, filterGender, searchTerm, t]);
 
   useEffect(() => {
     (async () => {
       try {
-        const [h, tList] = await Promise.all([api.getHalaqat(), api.getExamTypes()]);
+        const [h, tList] = await Promise.all([
+          api.getHalaqat(),
+          api.getExamTypes(),
+        ]);
         setHalaqat(h);
         if (tList.length > 0) setExamTypes(tList);
       } catch (err) {
@@ -162,11 +181,50 @@ const ExamList: React.FC<{
     const passed = exams.filter((e) => e.status === 'Pass').length;
     const avg =
       total > 0
-        ? Math.round(exams.reduce((s, e) => s + (e.percentage || 0), 0) / total)
+        ? Math.round(
+            exams.reduce((s, e) => s + (e.percentage || 0), 0) / total
+          )
         : 0;
     return { total, passed, avg };
   }, [exams]);
 
+  // ----------------------------------------------------------------
+  // Filters — sheet handlers
+  // ----------------------------------------------------------------
+  const openFilters = () => {
+    setFiltersDraft({
+      examType: filterType,
+      halaqah: filterHalaqah,
+      gender: filterGender,
+    });
+    setFiltersVisible(true);
+  };
+
+  const applyFilters = () => {
+    setFilterType(filtersDraft.examType);
+    setFilterHalaqah(filtersDraft.halaqah);
+    setFilterGender(filtersDraft.gender);
+    setFiltersVisible(false);
+  };
+
+  const clearAllFilters = () => {
+    setFilterType('All');
+    setFilterHalaqah('all');
+    setFilterGender('all');
+    setFiltersVisible(false);
+  };
+
+  const activeFilterCount = useMemo(() => {
+    let n = 0;
+    if (filterType !== 'All') n++;
+    if (filterHalaqah !== 'all') n++;
+    if (filterGender !== 'all') n++;
+    return n;
+  }, [filterType, filterHalaqah, filterGender]);
+
+  // ----------------------------------------------------------------
+  // Selection
+  // ----------------------------------------------------------------
   const toggleSelect = (id: string) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
@@ -182,6 +240,9 @@ const ExamList: React.FC<{
     setSelectionMode(false);
   };
 
+  // ----------------------------------------------------------------
+  // Bulk publish / unpublish
+  // ----------------------------------------------------------------
   const bulkPublish = async () => {
     const ids = Array.from(selectedIds);
     if (ids.length === 0) return;
@@ -293,6 +354,20 @@ const ExamList: React.FC<{
     setDetailsVisible(true);
   };
 
+  // ----------------------------------------------------------------
+  // Print / share handlers
+  // ----------------------------------------------------------------
+  const handlePrint = async (exam: Exam) => {
+    await printExamSheet({ exam, settings, language });
+  };
+
+  const handleShare = async (exam: Exam) => {
+    await shareExamSheetAsPdf({ exam, settings, language });
+  };
+
+  // ----------------------------------------------------------------
+  // Row rendering
+  // ----------------------------------------------------------------
   const renderExam = ({ item }: { item: Exam }) => {
     const formType = getExamFormType(item);
     const isSelected = selectedIds.has(item._id);
@@ -303,7 +378,9 @@ const ExamList: React.FC<{
       <TouchableOpacity
         style={[styles.examCard, isSelected && styles.examCardSelected]}
         activeOpacity={0.7}
-        onPress={() => (selectionMode ? toggleSelect(item._id) : openDetails(item))}
+        onPress={() =>
+          selectionMode ? toggleSelect(item._id) : openDetails(item)
+        }
         onLongPress={() => {
           setSelectionMode(true);
           toggleSelect(item._id);
@@ -343,7 +420,9 @@ const ExamList: React.FC<{
                   styles.typeTag,
                   {
                     backgroundColor:
-                      formType === 'reading' ? COLORS.purpleLight : COLORS.blueLight,
+                      formType === 'reading'
+                        ? COLORS.purpleLight
+                        : COLORS.blueLight,
                   },
                 ]}
               >
@@ -357,7 +436,9 @@ const ExamList: React.FC<{
                     styles.typeTagText,
                     {
                       color:
-                        formType === 'reading' ? COLORS.purple : COLORS.blue,
+                        formType === 'reading'
+                          ? COLORS.purple
+                          : COLORS.blue,
                     },
                   ]}
                 >
@@ -367,16 +448,31 @@ const ExamList: React.FC<{
                 </Text>
               </View>
               {item.isPublished ? (
-                <View style={[styles.typeTag, { backgroundColor: COLORS.primaryLight }]}>
-                  <Ionicons name="checkmark-circle" size={10} color={COLORS.primary} />
-                  <Text style={[styles.typeTagText, { color: COLORS.primary }]}>
+                <View
+                  style={[
+                    styles.typeTag,
+                    { backgroundColor: COLORS.primaryLight },
+                  ]}
+                >
+                  <Ionicons
+                    name="checkmark-circle"
+                    size={10}
+                    color={COLORS.primary}
+                  />
+                  <Text
+                    style={[styles.typeTagText, { color: COLORS.primary }]}
+                  >
                     {t('examinations.status.published')}
                   </Text>
                 </View>
               ) : (
-                <View style={[styles.typeTag, { backgroundColor: '#F1F5F9' }]}>
+                <View
+                  style={[styles.typeTag, { backgroundColor: '#F1F5F9' }]}
+                >
                   <Ionicons name="eye-off" size={10} color={COLORS.gray} />
-                  <Text style={[styles.typeTagText, { color: COLORS.gray }]}>
+                  <Text
+                    style={[styles.typeTagText, { color: COLORS.gray }]}
+                  >
                     {t('examinations.status.draft')}
                   </Text>
                 </View>
@@ -388,7 +484,9 @@ const ExamList: React.FC<{
             <Text style={styles.examScore}>
               {round2(item.obtainedMarks || 0)}
             </Text>
-            <Text style={styles.examScoreTotal}>/{item.totalMarks || 100}</Text>
+            <Text style={styles.examScoreTotal}>
+              /{item.totalMarks || 100}
+            </Text>
             <View style={styles.progressRow}>
               <View style={styles.progressBar}>
                 <View
@@ -396,7 +494,8 @@ const ExamList: React.FC<{
                     styles.progressFill,
                     {
                       width: `${Math.min(pct, 100)}%`,
-                      backgroundColor: pct >= passing ? COLORS.primary : COLORS.red,
+                      backgroundColor:
+                        pct >= passing ? COLORS.primary : COLORS.red,
                     },
                   ]}
                 />
@@ -407,7 +506,9 @@ const ExamList: React.FC<{
                 styles.statusBadge,
                 {
                   backgroundColor:
-                    item.status === 'Pass' ? COLORS.primaryLight : COLORS.redLight,
+                    item.status === 'Pass'
+                      ? COLORS.primaryLight
+                      : COLORS.redLight,
                 },
               ]}
             >
@@ -427,13 +528,75 @@ const ExamList: React.FC<{
             </View>
           </View>
         </View>
+
+        {/* Row actions */}
+        {!selectionMode && (
+          <View style={styles.rowActions}>
+            <TouchableOpacity
+              style={styles.rowActionBtn}
+              onPress={() => handlePrint(item)}
+              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+            >
+              <Ionicons
+                name="print-outline"
+                size={15}
+                color={COLORS.purple}
+              />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.rowActionBtn}
+              onPress={() => handleShare(item)}
+              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+            >
+              <Ionicons name="share-outline" size={15} color={COLORS.blue} />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.rowActionBtn}
+              onPress={() => onEdit(item)}
+              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+            >
+              <Ionicons
+                name="create-outline"
+                size={15}
+                color={COLORS.primary}
+              />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.rowActionBtn}
+              onPress={() => togglePublish(item)}
+              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+            >
+              <Ionicons
+                name={
+                  item.isPublished
+                    ? 'eye-off-outline'
+                    : 'cloud-upload-outline'
+                }
+                size={15}
+                color={item.isPublished ? COLORS.amber : COLORS.primary}
+              />
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.rowActionBtn}
+              onPress={() => deleteExam(item)}
+              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+            >
+              <Ionicons name="trash-outline" size={15} color={COLORS.red} />
+            </TouchableOpacity>
+          </View>
+        )}
       </TouchableOpacity>
     );
   };
 
   const headerSubtitleKey =
-    exams.length === 1 ? 'examinations.headerSubtitle' : 'examinations.headerSubtitlePlural';
+    exams.length === 1
+      ? 'examinations.headerSubtitle'
+      : 'examinations.headerSubtitlePlural';
 
+  // ----------------------------------------------------------------
+  // Render
+  // ----------------------------------------------------------------
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
       {/* HEADER */}
@@ -454,19 +617,32 @@ const ExamList: React.FC<{
               {t('examinations.selectedCount', { count: selectedIds.size })}
             </Text>
             <TouchableOpacity
-              style={[styles.headerIconBtn, { backgroundColor: COLORS.primaryLight }]}
+              style={[
+                styles.headerIconBtn,
+                { backgroundColor: COLORS.primaryLight },
+              ]}
               onPress={bulkPublish}
             >
-              <Ionicons name="checkmark-circle" size={18} color={COLORS.primary} />
+              <Ionicons
+                name="checkmark-circle"
+                size={18}
+                color={COLORS.primary}
+              />
             </TouchableOpacity>
             <TouchableOpacity
-              style={[styles.headerIconBtn, { backgroundColor: COLORS.amberLight }]}
+              style={[
+                styles.headerIconBtn,
+                { backgroundColor: COLORS.amberLight },
+              ]}
               onPress={bulkUnpublish}
             >
               <Ionicons name="eye-off" size={18} color={COLORS.amber} />
             </TouchableOpacity>
             <TouchableOpacity
-              style={[styles.headerIconBtn, { backgroundColor: COLORS.background }]}
+              style={[
+                styles.headerIconBtn,
+                { backgroundColor: COLORS.background },
+              ]}
               onPress={exitSelection}
             >
               <Ionicons name="close" size={18} color={COLORS.slate} />
@@ -478,7 +654,11 @@ const ExamList: React.FC<{
               style={styles.headerIconBtn}
               onPress={() => setSettingsVisible(true)}
             >
-              <Ionicons name="settings-outline" size={18} color={COLORS.slate} />
+              <Ionicons
+                name="settings-outline"
+                size={18}
+                color={COLORS.slate}
+              />
             </TouchableOpacity>
             <TouchableOpacity style={styles.addButton} onPress={onCreate}>
               <Ionicons name="add" size={22} color={COLORS.white} />
@@ -489,115 +669,99 @@ const ExamList: React.FC<{
 
       {publishStatus ? (
         <View style={styles.successBanner}>
-          <Ionicons name="checkmark-circle" size={16} color={COLORS.primary} />
+          <Ionicons
+            name="checkmark-circle"
+            size={16}
+            color={COLORS.primary}
+          />
           <Text style={styles.successText}>{publishStatus}</Text>
         </View>
       ) : null}
 
-      {/* SEARCH */}
+      {/* SEARCH + FILTERS BAR */}
       <View style={styles.searchContainer}>
-        <View style={styles.searchWrapper}>
-          <Ionicons name="search-outline" size={18} color={COLORS.gray} />
-          <TextInput
-            style={styles.searchInput}
-            placeholder={t('examinations.searchPlaceholder')}
-            placeholderTextColor="#A0AAA5"
-            value={searchTerm}
-            onChangeText={setSearchTerm}
-          />
-          {searchTerm.length > 0 && (
-            <TouchableOpacity onPress={() => setSearchTerm('')}>
-              <Ionicons name="close-circle" size={18} color={COLORS.gray} />
-            </TouchableOpacity>
-          )}
-        </View>
-      </View>
-
-      {/* TYPE FILTER */}
-      <View style={styles.filterRow}>
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={{ gap: 8, paddingVertical: 4 }}
-        >
-          <TouchableOpacity
-            style={[styles.filterChip, filterType === 'All' && styles.filterChipActive]}
-            onPress={() => setFilterType('All')}
-          >
-            <Text
-              style={[
-                styles.filterChipText,
-                filterType === 'All' && styles.filterChipTextActive,
-              ]}
-            >
-              {t('examinations.allTypes')}
-            </Text>
-          </TouchableOpacity>
-          {examTypes.map((typ) => (
-            <TouchableOpacity
-              key={typ}
-              style={[styles.filterChip, filterType === typ && styles.filterChipActive]}
-              onPress={() => setFilterType(typ)}
-            >
-              <Text
-                style={[
-                  styles.filterChipText,
-                  filterType === typ && styles.filterChipTextActive,
-                ]}
-              >
-                {typ}
-              </Text>
-            </TouchableOpacity>
-          ))}
-        </ScrollView>
-      </View>
-
-      {/* HALAQA FILTER */}
-      {halaqat.length > 0 && (
-        <View style={styles.filterRow}>
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            contentContainerStyle={{ gap: 8, paddingVertical: 4 }}
-          >
-            <TouchableOpacity
-              style={[
-                styles.filterChip,
-                filterHalaqah === 'all' && styles.filterChipActive,
-              ]}
-              onPress={() => setFilterHalaqah('all')}
-            >
-              <Text
-                style={[
-                  styles.filterChipText,
-                  filterHalaqah === 'all' && styles.filterChipTextActive,
-                ]}
-              >
-                {t('examinations.allHalaqaat')}
-              </Text>
-            </TouchableOpacity>
-            {halaqat.map((h) => (
-              <TouchableOpacity
-                key={h._id}
-                style={[
-                  styles.filterChip,
-                  filterHalaqah === h.name && styles.filterChipActive,
-                ]}
-                onPress={() => setFilterHalaqah(h.name)}
-              >
-                <Text
-                  style={[
-                    styles.filterChipText,
-                    filterHalaqah === h.name && styles.filterChipTextActive,
-                  ]}
-                >
-                  {h.name}
-                </Text>
+        <View style={styles.searchRow}>
+          <View style={styles.searchWrapper}>
+            <Ionicons name="search-outline" size={18} color={COLORS.gray} />
+            <TextInput
+              style={styles.searchInput}
+              placeholder={t('examinations.searchPlaceholder')}
+              placeholderTextColor="#A0AAA5"
+              value={searchTerm}
+              onChangeText={setSearchTerm}
+            />
+            {searchTerm.length > 0 && (
+              <TouchableOpacity onPress={() => setSearchTerm('')}>
+                <Ionicons
+                  name="close-circle"
+                  size={18}
+                  color={COLORS.gray}
+                />
               </TouchableOpacity>
-            ))}
-          </ScrollView>
+            )}
+          </View>
+
+          <TouchableOpacity
+            style={[
+              styles.filtersButton,
+              activeFilterCount > 0 && styles.filtersButtonActive,
+            ]}
+            onPress={openFilters}
+            activeOpacity={0.8}
+          >
+            <Ionicons
+              name="options-outline"
+              size={18}
+              color={activeFilterCount > 0 ? '#fff' : COLORS.slate}
+            />
+            {activeFilterCount > 0 && (
+              <View style={styles.filtersBadge}>
+                <Text style={styles.filtersBadgeText}>
+                  {activeFilterCount}
+                </Text>
+              </View>
+            )}
+          </TouchableOpacity>
         </View>
-      )}
+
+        {/* Active filter pills row */}
+        {activeFilterCount > 0 && (
+          <View style={styles.activePillsRow}>
+            {filterType !== 'All' && (
+              <View style={styles.activePill}>
+                <Text style={styles.activePillText} numberOfLines={1}>
+                  {filterType}
+                </Text>
+              </View>
+            )}
+            {filterHalaqah !== 'all' && (
+              <View style={styles.activePill}>
+                <Text style={styles.activePillText} numberOfLines={1}>
+                  {filterHalaqah}
+                </Text>
+              </View>
+            )}
+            {filterGender !== 'all' && (
+              <View style={styles.activePill}>
+                <Text style={styles.activePillText} numberOfLines={1}>
+                  {filterGender === 'Male'
+                    ? t('examinations.male')
+                    : t('examinations.female')}
+                </Text>
+              </View>
+            )}
+            <TouchableOpacity
+              style={styles.clearPill}
+              onPress={clearAllFilters}
+            >
+              <Ionicons name="close" size={12} color={COLORS.red} />
+              <Text style={styles.clearPillText}>
+                {t('examinations.clearFilters') || 'Clear'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
 
       {error ? (
         <View style={styles.errorBanner}>
@@ -609,7 +773,9 @@ const ExamList: React.FC<{
       {loading && exams.length === 0 ? (
         <View style={styles.loadingWrap}>
           <ActivityIndicator size="large" color={COLORS.primary} />
-          <Text style={styles.loadingText}>{t('examinations.loading')}</Text>
+          <Text style={styles.loadingText}>
+            {t('examinations.loading')}
+          </Text>
         </View>
       ) : (
         <FlatList
@@ -628,14 +794,25 @@ const ExamList: React.FC<{
           }
           ListEmptyComponent={
             <View style={styles.emptyContainer}>
-              <Ionicons name="document-text-outline" size={64} color="#CBD5E1" />
-              <Text style={styles.emptyTitle}>{t('examinations.noResultsTitle')}</Text>
-              <Text style={styles.emptyText}>{t('examinations.noResultsEmpty')}</Text>
+              <Ionicons
+                name="document-text-outline"
+                size={64}
+                color="#CBD5E1"
+              />
+              <Text style={styles.emptyTitle}>
+                {t('examinations.noResultsTitle')}
+              </Text>
+              <Text style={styles.emptyText}>
+                {activeFilterCount > 0 || searchTerm
+                  ? t('examinations.noResultsFiltered')
+                  : t('examinations.noResultsEmpty')}
+              </Text>
             </View>
           }
         />
       )}
 
+      {/* DETAILS MODAL */}
       <ExamDetailsModal
         visible={detailsVisible}
         exam={detailsExam}
@@ -655,7 +832,8 @@ const ExamList: React.FC<{
         }}
       />
 
-      <SettingsModal
+      {/* SETTINGS MODAL */}
+      <ExamSettingsModal
         visible={settingsVisible}
         onClose={() => setSettingsVisible(false)}
         settings={settings}
@@ -664,533 +842,223 @@ const ExamList: React.FC<{
           setSettingsVisible(false);
         }}
       />
+
+      {/* ==================================================
+          FILTERS BOTTOM SHEET
+      ================================================== */}
+      <Modal
+        visible={filtersVisible}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setFiltersVisible(false)}
+      >
+        <View style={styles.sheetOverlay}>
+          <View style={styles.sheetContainer}>
+            {/* Sheet header */}
+            <View style={styles.sheetHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.sheetTitle}>
+                  {t('examinations.filtersTitle') || 'Filters'}
+                </Text>
+                <Text style={styles.sheetSubtitle}>
+                  {t('examinations.filtersSubtitle') ||
+                    'Narrow down the exam list'}
+                </Text>
+              </View>
+              <TouchableOpacity
+                style={styles.sheetCloseBtn}
+                onPress={() => setFiltersVisible(false)}
+              >
+                <Ionicons name="close" size={20} color={COLORS.slate} />
+              </TouchableOpacity>
+            </View>
+
+            <ScrollView
+              style={styles.sheetBody}
+              contentContainerStyle={{ paddingBottom: 20 }}
+              showsVerticalScrollIndicator={false}
+            >
+              {/* Exam Type */}
+              <Text style={styles.sheetSectionLabel}>
+                {t('examinations.examType') || 'Exam Type'}
+              </Text>
+              <View style={styles.chipRow}>
+                <TouchableOpacity
+                  style={[
+                    styles.sheetChip,
+                    filtersDraft.examType === 'All' &&
+                      styles.sheetChipActive,
+                  ]}
+                  onPress={() =>
+                    setFiltersDraft((p) => ({ ...p, examType: 'All' }))
+                  }
+                >
+                  <Text
+                    style={[
+                      styles.sheetChipText,
+                      filtersDraft.examType === 'All' &&
+                        styles.sheetChipTextActive,
+                    ]}
+                  >
+                    {t('examinations.allTypes')}
+                  </Text>
+                </TouchableOpacity>
+                {examTypes.map((typ) => (
+                  <TouchableOpacity
+                    key={typ}
+                    style={[
+                      styles.sheetChip,
+                      filtersDraft.examType === typ &&
+                        styles.sheetChipActive,
+                    ]}
+                    onPress={() =>
+                      setFiltersDraft((p) => ({ ...p, examType: typ }))
+                    }
+                  >
+                    <Text
+                      style={[
+                        styles.sheetChipText,
+                        filtersDraft.examType === typ &&
+                          styles.sheetChipTextActive,
+                      ]}
+                    >
+                      {typ}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              {/* Halaqah */}
+              {halaqat.length > 0 && (
+                <>
+                  <Text
+                    style={[
+                      styles.sheetSectionLabel,
+                      { marginTop: 20 },
+                    ]}
+                  >
+                    {t('examinations.halaqah') || 'Halaqah'}
+                  </Text>
+                  <View style={styles.chipRow}>
+                    <TouchableOpacity
+                      style={[
+                        styles.sheetChip,
+                        filtersDraft.halaqah === 'all' &&
+                          styles.sheetChipActive,
+                      ]}
+                      onPress={() =>
+                        setFiltersDraft((p) => ({ ...p, halaqah: 'all' }))
+                      }
+                    >
+                      <Text
+                        style={[
+                          styles.sheetChipText,
+                          filtersDraft.halaqah === 'all' &&
+                            styles.sheetChipTextActive,
+                        ]}
+                      >
+                        {t('examinations.allHalaqaat')}
+                      </Text>
+                    </TouchableOpacity>
+                    {halaqat.map((h) => (
+                      <TouchableOpacity
+                        key={h._id}
+                        style={[
+                          styles.sheetChip,
+                          filtersDraft.halaqah === h.name &&
+                            styles.sheetChipActive,
+                        ]}
+                        onPress={() =>
+                          setFiltersDraft((p) => ({
+                            ...p,
+                            halaqah: h.name,
+                          }))
+                        }
+                      >
+                        <Text
+                          style={[
+                            styles.sheetChipText,
+                            filtersDraft.halaqah === h.name &&
+                              styles.sheetChipTextActive,
+                          ]}
+                        >
+                          {h.name}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </>
+              )}
+
+              {/* Gender */}
+              <Text
+                style={[styles.sheetSectionLabel, { marginTop: 20 }]}
+              >
+                {t('examinations.gender') || 'Gender'}
+              </Text>
+              <View style={styles.chipRow}>
+                {[
+                  {
+                    key: 'all',
+                    label: t('examinations.allGenders'),
+                  },
+                  { key: 'Male', label: t('examinations.male') },
+                  { key: 'Female', label: t('examinations.female') },
+                ].map(({ key, label }) => (
+                  <TouchableOpacity
+                    key={key}
+                    style={[
+                      styles.sheetChip,
+                      filtersDraft.gender === key &&
+                        styles.sheetChipActive,
+                    ]}
+                    onPress={() =>
+                      setFiltersDraft((p) => ({ ...p, gender: key }))
+                    }
+                  >
+                    <Text
+                      style={[
+                        styles.sheetChipText,
+                        filtersDraft.gender === key &&
+                          styles.sheetChipTextActive,
+                      ]}
+                    >
+                      {label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </ScrollView>
+
+            {/* Footer */}
+            <View style={styles.sheetFooter}>
+              <TouchableOpacity
+                style={styles.sheetClearBtn}
+                onPress={clearAllFilters}
+              >
+                <Text style={styles.sheetClearBtnText}>
+                  {t('examinations.clearFilters') || 'Clear all'}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.sheetApplyBtn}
+                onPress={applyFilters}
+              >
+                <Ionicons name="checkmark" size={16} color="#fff" />
+                <Text style={styles.sheetApplyBtnText}>
+                  {t('examinations.applyFilters') || 'Apply'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 };
 
 // ============================================================
-// DETAILS MODAL
-// ============================================================
-const ExamDetailsModal: React.FC<{
-  visible: boolean;
-  exam: Exam | null;
-  settings: ExamSettings | null;
-  onClose: () => void;
-  onEdit: (exam: Exam) => void;
-  onTogglePublish: (exam: Exam) => void;
-  onDelete: (exam: Exam) => void;
-}> = ({ visible, exam, settings, onClose, onEdit, onTogglePublish, onDelete }) => {
-  const { t } = useTranslation();
-  if (!exam) return null;
-
-  const formType = getExamFormType(exam);
-  const pct = round2(exam.percentage || 0);
-  const passing = exam.passingMark || exam.settings?.passingMark || 60;
-  const examiners = exam.examiners || (exam.examiner ? [exam.examiner] : []);
-
-  return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <View style={styles.modalOverlay}>
-        <View style={styles.modalContainer}>
-          <View style={styles.modalHeader}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.modalTitle}>{t('examinations.details.title')}</Text>
-              <Text style={styles.modalSubtitle}>{exam.studentName}</Text>
-            </View>
-            <TouchableOpacity style={styles.modalCloseBtn} onPress={onClose}>
-              <Ionicons name="close" size={22} color={COLORS.slate} />
-            </TouchableOpacity>
-          </View>
-
-          <ScrollView style={styles.modalBody} showsVerticalScrollIndicator={false}>
-            <View style={styles.summaryCard}>
-              <View style={styles.summaryAvatar}>
-                <Text style={styles.summaryAvatarText}>
-                  {exam.studentName?.charAt(0)?.toUpperCase() || '?'}
-                </Text>
-              </View>
-              <Text style={styles.summaryName}>{exam.studentName}</Text>
-              <Text style={styles.summaryMeta}>
-                {exam.halaqah} · {exam.examType}
-              </Text>
-
-              <View style={styles.summaryScoreBox}>
-                <Text style={styles.summaryScoreValue}>
-                  {round2(exam.obtainedMarks || 0)}
-                </Text>
-                <Text style={styles.summaryScoreTotal}>/ {exam.totalMarks || 100}</Text>
-              </View>
-
-              <View style={styles.summaryProgress}>
-                <View
-                  style={[
-                    styles.summaryProgressFill,
-                    {
-                      width: `${Math.min(pct, 100)}%`,
-                      backgroundColor: pct >= passing ? COLORS.primary : COLORS.red,
-                    },
-                  ]}
-                />
-              </View>
-              <Text style={styles.summaryPct}>
-                {pct}% ·{' '}
-                {exam.status === 'Pass'
-                  ? t('examinations.status.pass')
-                  : t('examinations.status.fail')}
-              </Text>
-            </View>
-
-            <InfoRow
-              label={t('examinations.details.formType')}
-              value={
-                formType === 'reading'
-                  ? t('examinations.formTypes.reading')
-                  : t('examinations.formTypes.memorization')
-              }
-              icon="book-outline"
-            />
-            <InfoRow
-              label={t('examinations.details.date')}
-              value={
-                exam.dateGregorian
-                  ? new Date(exam.dateGregorian).toLocaleDateString()
-                  : exam.date
-                  ? new Date(exam.date).toLocaleDateString()
-                  : t('examinations.details.notAvailable')
-              }
-              icon="calendar-outline"
-            />
-            <InfoRow
-              label={t('examinations.details.publish')}
-              value={
-                exam.isPublished
-                  ? t('examinations.status.published')
-                  : t('examinations.status.draft')
-              }
-              icon={exam.isPublished ? 'checkmark-circle-outline' : 'eye-off-outline'}
-            />
-            {exam.examScope ? (
-              <InfoRow
-                label={t('examinations.details.scope')}
-                value={
-                  exam.examScope === 'surah'
-                    ? `${getSurahName(exam.fromSurah)} → ${getSurahName(exam.toSurah)}`
-                    : `${getJuzName(exam.fromJuz)} → ${getJuzName(exam.toJuz)}`
-                }
-                icon="list-outline"
-              />
-            ) : null}
-
-            {formType === 'memorization' && (exam.questions || []).length > 0 && (
-              <View style={styles.block}>
-                <Text style={styles.blockTitle}>
-                  {t('examinations.details.questionBreakdown')}
-                </Text>
-                <View style={styles.table}>
-                  <View style={[styles.tableRow, styles.tableHeader]}>
-                    <Text style={[styles.tableCell, styles.tableHeaderText]}>
-                      {t('examinations.table.q')}
-                    </Text>
-                    <Text style={[styles.tableCell, styles.tableHeaderText]}>
-                      {t('examinations.table.page')}
-                    </Text>
-                    <Text style={[styles.tableCell, styles.tableHeaderText]}>
-                      {t('examinations.table.fathi')}
-                    </Text>
-                    <Text style={[styles.tableCell, styles.tableHeaderText]}>
-                      {t('examinations.table.lahni')}
-                    </Text>
-                    <Text style={[styles.tableCell, styles.tableHeaderText]}>
-                      {t('examinations.table.ruju')}
-                    </Text>
-                    <Text style={[styles.tableCell, styles.tableHeaderText]}>
-                      {t('examinations.table.tajwid')}
-                    </Text>
-                  </View>
-                  {(exam.questions || []).map((q, idx) => (
-                    <View key={idx} style={styles.tableRow}>
-                      <Text style={styles.tableCell}>{idx + 1}</Text>
-                      <Text style={styles.tableCell}>{q.page || '-'}</Text>
-                      <Text style={styles.tableCell}>{q.fathi}</Text>
-                      <Text style={styles.tableCell}>{q.lahni}</Text>
-                      <Text style={styles.tableCell}>{q.ruju || 0}</Text>
-                      <Text style={styles.tableCell}>{q.tajwid}</Text>
-                    </View>
-                  ))}
-                </View>
-              </View>
-            )}
-
-            {formType === 'reading' && (
-              <View style={styles.block}>
-                <Text style={styles.blockTitle}>
-                  {t('examinations.details.readingTotals')}
-                </Text>
-                {(() => {
-                  const headers =
-                    exam.readingWritingHeaders ||
-                    settings?.readingWritingHeaders ||
-                    DEFAULT_READING_HEADERS;
-                  const scores = exam.readingWritingScores || {};
-                  const weights =
-                    exam.readingWritingWeights ||
-                    settings?.readingWritingWeights ||
-                    DEFAULT_READING_WEIGHTS;
-                  const skillHeaders = headers.filter(
-                    (h) =>
-                      h.id !== 'total' &&
-                      h.id !== 'estimation' &&
-                      h.id !== 'readingScore' &&
-                      h.id !== 'writingScore' &&
-                      h.id !== 'hijaa' &&
-                      h.id !== 'ayahs'
-                  );
-
-                  let readingTotal = 0,
-                    writingTotal = 0,
-                    hijaaTotal = 0,
-                    ayahsTotal = 0;
-                  skillHeaders.forEach((h) => {
-                    readingTotal += parseFloat(String(scores[`${h.id}_reading`] ?? 0)) || 0;
-                    writingTotal += parseFloat(String(scores[`${h.id}_writing`] ?? 0)) || 0;
-                    hijaaTotal += parseFloat(String(scores[`${h.id}_hijaa`] ?? 0)) || 0;
-                    ayahsTotal += parseFloat(String(scores[`${h.id}_ayahs`] ?? 0)) || 0;
-                  });
-                  const total = readingTotal + writingTotal + hijaaTotal + ayahsTotal;
-
-                  return (
-                    <View style={styles.readingStats}>
-                      <ReadingStat
-                        label={t('examinations.reading.reading')}
-                        value={round2(readingTotal)}
-                        max={weights.readingScore}
-                        color={COLORS.blue}
-                      />
-                      <ReadingStat
-                        label={t('examinations.reading.writing')}
-                        value={round2(writingTotal)}
-                        max={weights.writingScore}
-                        color={COLORS.primary}
-                      />
-                      <ReadingStat
-                        label={t('examinations.reading.hijaa')}
-                        value={round2(hijaaTotal)}
-                        max={weights.hijaa}
-                        color={COLORS.amber}
-                      />
-                      <ReadingStat
-                        label={t('examinations.reading.ayahs')}
-                        value={round2(ayahsTotal)}
-                        max={weights.ayahs}
-                        color={COLORS.pink}
-                      />
-                      <ReadingStat
-                        label={t('examinations.reading.total')}
-                        value={round2(total)}
-                        max={
-                          weights.readingScore +
-                          weights.writingScore +
-                          weights.hijaa +
-                          weights.ayahs
-                        }
-                        color={COLORS.purple}
-                      />
-                    </View>
-                  );
-                })()}
-              </View>
-            )}
-
-            {(exam.notes?.positive || exam.notes?.negative) && (
-              <View style={styles.block}>
-                <Text style={styles.blockTitle}>
-                  {t('examinations.details.notes')}
-                </Text>
-                {exam.notes?.positive ? (
-                  <View style={[styles.noteBox, { backgroundColor: COLORS.primaryLight }]}>
-                    <Text style={[styles.noteLabel, { color: COLORS.primary }]}>
-                      {t('examinations.details.positive')}
-                    </Text>
-                    <Text style={styles.noteText}>{exam.notes.positive}</Text>
-                  </View>
-                ) : null}
-                {exam.notes?.negative ? (
-                  <View style={[styles.noteBox, { backgroundColor: COLORS.amberLight }]}>
-                    <Text style={[styles.noteLabel, { color: COLORS.amber }]}>
-                      {t('examinations.details.areasToImprove')}
-                    </Text>
-                    <Text style={styles.noteText}>{exam.notes.negative}</Text>
-                  </View>
-                ) : null}
-              </View>
-            )}
-
-            {examiners.length > 0 && (
-              <View style={styles.block}>
-                <Text style={styles.blockTitle}>
-                  {t('examinations.details.committee')}
-                </Text>
-                {examiners.map((ex, idx) => (
-                  <View key={idx} style={styles.committeeRow}>
-                    <Ionicons name="person-outline" size={14} color={COLORS.purple} />
-                    <Text style={styles.committeeName}>{ex}</Text>
-                    <View style={styles.committeeLine} />
-                  </View>
-                ))}
-              </View>
-            )}
-
-            <View style={{ height: 20 }} />
-          </ScrollView>
-
-          <View style={styles.modalActions}>
-            <TouchableOpacity style={styles.actionBtnOutline} onPress={() => onEdit(exam)}>
-              <Ionicons name="create-outline" size={16} color={COLORS.primary} />
-              <Text style={styles.actionBtnOutlineText}>
-                {t('examinations.details.edit')}
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[
-                styles.actionBtnOutline,
-                {
-                  borderColor: exam.isPublished ? COLORS.amber : COLORS.primary,
-                },
-              ]}
-              onPress={() => onTogglePublish(exam)}
-            >
-              <Ionicons
-                name={exam.isPublished ? 'eye-off' : 'checkmark-circle'}
-                size={16}
-                color={exam.isPublished ? COLORS.amber : COLORS.primary}
-              />
-              <Text
-                style={[
-                  styles.actionBtnOutlineText,
-                  { color: exam.isPublished ? COLORS.amber : COLORS.primary },
-                ]}
-              >
-                {exam.isPublished
-                  ? t('examinations.bulk.unpublish')
-                  : t('examinations.bulk.publish')}
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.actionBtnDanger} onPress={() => onDelete(exam)}>
-              <Ionicons name="trash-outline" size={16} color={COLORS.red} />
-              <Text style={styles.actionBtnDangerText}>
-                {t('examinations.details.delete')}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </View>
-    </Modal>
-  );
-};
-
-const ReadingStat: React.FC<{
-  label: string;
-  value: number;
-  max: number;
-  color: string;
-}> = ({ label, value, max, color }) => (
-  <View style={styles.readingStatTile}>
-    <Text style={styles.readingStatLabel}>{label}</Text>
-    <Text style={[styles.readingStatValue, { color }]}>
-      {value} / {max}
-    </Text>
-  </View>
-);
-
-const InfoRow: React.FC<{
-  label: string;
-  value: string;
-  icon: keyof typeof Ionicons.glyphMap;
-}> = ({ label, value, icon }) => (
-  <View style={styles.infoRow}>
-    <View style={styles.infoIcon}>
-      <Ionicons name={icon} size={16} color={COLORS.primary} />
-    </View>
-    <View style={styles.infoContent}>
-      <Text style={styles.infoLabel}>{label}</Text>
-      <Text style={styles.infoValue}>{value || '—'}</Text>
-    </View>
-  </View>
-);
-
-// ============================================================
-// SETTINGS MODAL
-// ============================================================
-const SettingsModal: React.FC<{
-  visible: boolean;
-  onClose: () => void;
-  settings: ExamSettings | null;
-  onSaved: () => void;
-}> = ({ visible, onClose, settings, onSaved }) => {
-  const { t } = useTranslation();
-  const [passingMark, setPassingMark] = useState('60');
-  const [passingRW, setPassingRW] = useState('60');
-  const [examTypes, setExamTypes] = useState<string[]>(DEFAULT_EXAM_TYPES);
-  const [newType, setNewType] = useState('');
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    if (!visible) return;
-    setPassingMark(String(settings?.passingMark ?? 60));
-    setPassingRW(String(settings?.passingMarkReadingWriting ?? 60));
-    setExamTypes(settings?.examTypes || DEFAULT_EXAM_TYPES);
-    setNewType('');
-  }, [visible, settings]);
-
-  const addType = () => {
-    const v = newType.trim();
-    if (!v) return;
-    if (examTypes.includes(v)) return;
-    setExamTypes([...examTypes, v]);
-    setNewType('');
-  };
-
-  const removeType = (v: string) => {
-    setExamTypes(examTypes.filter((x) => x !== v));
-  };
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      await api.saveSettings({
-        passingMark: parseInt(passingMark, 10) || 60,
-        passingMarkReadingWriting: parseInt(passingRW, 10) || 60,
-        examTypes,
-      });
-      onSaved();
-    } catch (err: any) {
-      Alert.alert(
-        t('examinations.errorTitle'),
-        err?.message || t('examinations.settings.saveFailed')
-      );
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <Modal
-      visible={visible}
-      animationType="slide"
-      transparent
-      onRequestClose={() => !saving && onClose()}
-    >
-      <KeyboardAvoidingView
-        style={styles.modalOverlay}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      >
-        <View style={styles.modalContainer}>
-          <View style={styles.modalHeader}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.modalTitle}>{t('examinations.settings.title')}</Text>
-              <Text style={styles.modalSubtitle}>
-                {t('examinations.settings.subtitle')}
-              </Text>
-            </View>
-            <TouchableOpacity
-              style={styles.modalCloseBtn}
-              onPress={onClose}
-              disabled={saving}
-            >
-              <Ionicons name="close" size={22} color={COLORS.slate} />
-            </TouchableOpacity>
-          </View>
-
-          <ScrollView
-            style={styles.modalBody}
-            keyboardShouldPersistTaps="handled"
-            showsVerticalScrollIndicator={false}
-          >
-            <Text style={styles.formLabel}>
-              {t('examinations.settings.passingMemorization')}
-            </Text>
-            <TextInput
-              style={styles.formInput}
-              value={passingMark}
-              onChangeText={(v) => setPassingMark(v.replace(/[^0-9]/g, ''))}
-              keyboardType="numeric"
-            />
-
-            <Text style={styles.formLabel}>
-              {t('examinations.settings.passingReading')}
-            </Text>
-            <TextInput
-              style={styles.formInput}
-              value={passingRW}
-              onChangeText={(v) => setPassingRW(v.replace(/[^0-9]/g, ''))}
-              keyboardType="numeric"
-            />
-
-            <Text style={[styles.formLabel, { marginTop: 20 }]}>
-              {t('examinations.settings.examTypes')}
-            </Text>
-            <View style={styles.chipRow}>
-              {examTypes.map((typ) => (
-                <View key={typ} style={styles.typeRow}>
-                  <Text style={styles.typeRowText}>{typ}</Text>
-                  <TouchableOpacity onPress={() => removeType(typ)}>
-                    <Ionicons name="close-circle" size={16} color={COLORS.red} />
-                  </TouchableOpacity>
-                </View>
-              ))}
-            </View>
-
-            <View style={styles.addTypeRow}>
-              <TextInput
-                style={[styles.formInput, { flex: 1 }]}
-                value={newType}
-                onChangeText={setNewType}
-                placeholder={t('examinations.settings.newTypePlaceholder')}
-                placeholderTextColor="#A0AAA5"
-              />
-              <TouchableOpacity style={styles.addTypeBtn} onPress={addType}>
-                <Ionicons name="add" size={18} color={COLORS.white} />
-              </TouchableOpacity>
-            </View>
-
-            <View style={{ height: 20 }} />
-          </ScrollView>
-
-          <View style={styles.modalActions}>
-            <TouchableOpacity
-              style={styles.cancelBtn}
-              onPress={onClose}
-              disabled={saving}
-            >
-              <Text style={styles.cancelBtnText}>
-                {t('examinations.settings.cancel')}
-              </Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.saveBtn, saving && { opacity: 0.7 }]}
-              onPress={save}
-              disabled={saving}
-            >
-              {saving ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
-                <>
-                  <Ionicons name="checkmark" size={16} color="#fff" />
-                  <Text style={styles.saveBtnText}>
-                    {t('examinations.settings.save')}
-                  </Text>
-                </>
-              )}
-            </TouchableOpacity>
-          </View>
-        </View>
-      </KeyboardAvoidingView>
-    </Modal>
-  );
-};
-
-// ============================================================
-// STYLES (unchanged)
+// STYLES
 // ============================================================
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
@@ -1205,7 +1073,11 @@ const styles = StyleSheet.create({
   headerTitle: { fontSize: 22, fontWeight: '800', color: COLORS.slate },
   headerSubtitle: { fontSize: 12, color: COLORS.slateMuted, marginTop: 2 },
   selectionActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  selectionCount: { fontSize: 12, fontWeight: '700', color: COLORS.slateMuted },
+  selectionCount: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.slateMuted,
+  },
   headerIconBtn: {
     width: 38,
     height: 38,
@@ -1236,9 +1108,25 @@ const styles = StyleSheet.create({
     borderColor: '#BFE9D4',
     borderRadius: 10,
   },
-  successText: { flex: 1, fontSize: 12, fontWeight: '700', color: COLORS.primary },
-  searchContainer: { paddingHorizontal: 16, paddingBottom: 8 },
+  successText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.primary,
+  },
+
+  // ---------- Search + Filters bar ----------
+  searchContainer: {
+    paddingHorizontal: 16,
+    paddingBottom: 10,
+  },
+  searchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
   searchWrapper: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: COLORS.white,
@@ -1246,25 +1134,86 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     borderWidth: 1,
     borderColor: COLORS.border,
-    height: 44,
+    height: 46,
     gap: 8,
   },
-  searchInput: { flex: 1, fontSize: 14, color: COLORS.slate },
-  filterRow: { paddingHorizontal: 16, paddingBottom: 6 },
-  filterChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 7,
-    borderRadius: 999,
+  searchInput: {
+    flex: 1,
+    fontSize: 14,
+    color: COLORS.slate,
+  },
+  filtersButton: {
+    width: 46,
+    height: 46,
+    borderRadius: 12,
     backgroundColor: COLORS.white,
     borderWidth: 1,
     borderColor: COLORS.border,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  filterChipActive: {
-    backgroundColor: COLORS.primaryLight,
+  filtersButtonActive: {
+    backgroundColor: COLORS.primary,
     borderColor: COLORS.primary,
   },
-  filterChipText: { fontSize: 12, fontWeight: '700', color: COLORS.slateMuted },
-  filterChipTextActive: { color: COLORS.primary },
+  filtersBadge: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    minWidth: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: COLORS.red,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 4,
+    borderWidth: 2,
+    borderColor: COLORS.white,
+  },
+  filtersBadgeText: {
+    color: '#fff',
+    fontSize: 10,
+    fontWeight: '800',
+  },
+
+  // Active filter pills
+  activePillsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 8,
+  },
+  activePill: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: COLORS.primaryLight,
+    borderWidth: 1,
+    borderColor: COLORS.primary + '55',
+  },
+  activePillText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.primary,
+  },
+  clearPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 999,
+    backgroundColor: COLORS.redLight,
+    borderWidth: 1,
+    borderColor: '#F6C8C8',
+  },
+  clearPillText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.red,
+  },
+
   errorBanner: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1277,10 +1226,19 @@ const styles = StyleSheet.create({
     borderColor: '#F6C8C8',
     borderRadius: 12,
   },
-  errorText: { flex: 1, fontSize: 12, fontWeight: '600', color: COLORS.red },
+  errorText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.red,
+  },
   loadingWrap: { alignItems: 'center', paddingVertical: 60 },
   loadingText: { marginTop: 12, color: COLORS.slateMuted, fontSize: 13 },
-  listContent: { paddingHorizontal: 16, paddingBottom: 24, paddingTop: 4 },
+  listContent: {
+    paddingHorizontal: 16,
+    paddingBottom: 24,
+    paddingTop: 4,
+  },
   examCard: {
     backgroundColor: COLORS.white,
     borderRadius: 16,
@@ -1289,7 +1247,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.border,
   },
-  examCardSelected: { borderColor: COLORS.blue, backgroundColor: '#F0F7FF' },
+  examCardSelected: {
+    borderColor: COLORS.blue,
+    backgroundColor: '#F0F7FF',
+  },
   checkboxTouch: { paddingRight: 8, paddingVertical: 8 },
   examRow: { flexDirection: 'row', alignItems: 'center' },
   avatar: {
@@ -1305,7 +1266,12 @@ const styles = StyleSheet.create({
   examInfo: { flex: 1 },
   examStudent: { fontSize: 15, fontWeight: '700', color: COLORS.slate },
   examMeta: { fontSize: 11, color: COLORS.slateMuted, marginTop: 2 },
-  examTags: { flexDirection: 'row', gap: 6, marginTop: 6, flexWrap: 'wrap' },
+  examTags: {
+    flexDirection: 'row',
+    gap: 6,
+    marginTop: 6,
+    flexWrap: 'wrap',
+  },
   typeTag: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1317,7 +1283,11 @@ const styles = StyleSheet.create({
   typeTagText: { fontSize: 10, fontWeight: '700' },
   examRight: { alignItems: 'flex-end', marginLeft: 8, minWidth: 80 },
   examScore: { fontSize: 18, fontWeight: '800', color: COLORS.slate },
-  examScoreTotal: { fontSize: 11, color: COLORS.slateMuted, marginBottom: 4 },
+  examScoreTotal: {
+    fontSize: 11,
+    color: COLORS.slateMuted,
+    marginBottom: 4,
+  },
   progressRow: { width: 70, marginBottom: 4 },
   progressBar: {
     height: 4,
@@ -1326,10 +1296,46 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   progressFill: { height: '100%', borderRadius: 2 },
-  statusBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
+  statusBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
   statusText: { fontSize: 10, fontWeight: '800' },
-  emptyContainer: { alignItems: 'center', paddingVertical: 60, paddingHorizontal: 32 },
-  emptyTitle: { fontSize: 17, fontWeight: '700', color: COLORS.slate, marginTop: 16 },
+
+  // Row actions
+  rowActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+    gap: 4,
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#F1F5F9',
+  },
+  rowActionBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+
+  emptyContainer: {
+    alignItems: 'center',
+    paddingVertical: 60,
+    paddingHorizontal: 32,
+  },
+  emptyTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: COLORS.slate,
+    marginTop: 16,
+  },
   emptyText: {
     fontSize: 13,
     color: COLORS.slateMuted,
@@ -1337,27 +1343,39 @@ const styles = StyleSheet.create({
     marginTop: 8,
     lineHeight: 20,
   },
-  modalOverlay: {
+
+  // ---------- Filters bottom sheet ----------
+  sheetOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    backgroundColor: 'rgba(15, 23, 42, 0.55)',
     justifyContent: 'flex-end',
   },
-  modalContainer: {
+  sheetContainer: {
     backgroundColor: COLORS.white,
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
-    maxHeight: '92%',
+    maxHeight: '85%',
+    overflow: 'hidden',
   },
-  modalHeader: {
+  sheetHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 20,
+    paddingHorizontal: 20,
+    paddingVertical: 16,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
   },
-  modalTitle: { fontSize: 18, fontWeight: '800', color: COLORS.slate },
-  modalSubtitle: { fontSize: 12, color: COLORS.slateMuted, marginTop: 2 },
-  modalCloseBtn: {
+  sheetTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: COLORS.slate,
+  },
+  sheetSubtitle: {
+    fontSize: 12,
+    color: COLORS.slateMuted,
+    marginTop: 2,
+  },
+  sheetCloseBtn: {
     width: 34,
     height: 34,
     borderRadius: 17,
@@ -1365,193 +1383,51 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  modalBody: { paddingHorizontal: 20, paddingTop: 12 },
-  summaryCard: {
-    alignItems: 'center',
-    paddingVertical: 16,
-    marginBottom: 12,
-    backgroundColor: COLORS.background,
-    borderRadius: 14,
+  sheetBody: {
+    paddingHorizontal: 20,
+    paddingTop: 16,
   },
-  summaryAvatar: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-    backgroundColor: COLORS.blue,
-    alignItems: 'center',
-    justifyContent: 'center',
+  sheetSectionLabel: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: COLORS.slateMuted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
     marginBottom: 8,
   },
-  summaryAvatarText: { fontSize: 28, fontWeight: '800', color: '#fff' },
-  summaryName: { fontSize: 18, fontWeight: '800', color: COLORS.slate },
-  summaryMeta: { fontSize: 12, color: COLORS.slateMuted, marginTop: 2 },
-  summaryScoreBox: { flexDirection: 'row', alignItems: 'baseline', marginTop: 12 },
-  summaryScoreValue: { fontSize: 34, fontWeight: '800', color: COLORS.slate },
-  summaryScoreTotal: { fontSize: 16, color: COLORS.slateMuted, marginLeft: 4 },
-  summaryProgress: {
-    width: '80%',
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#E2E8F0',
-    overflow: 'hidden',
-    marginTop: 10,
-  },
-  summaryProgressFill: { height: '100%', borderRadius: 4 },
-  summaryPct: { fontSize: 13, fontWeight: '700', color: COLORS.slate, marginTop: 8 },
-  infoRow: {
+  chipRow: {
     flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#F1F5F9',
-  },
-  infoIcon: {
-    width: 34,
-    height: 34,
-    borderRadius: 17,
-    backgroundColor: COLORS.primaryLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 12,
-  },
-  infoContent: { flex: 1 },
-  infoLabel: { fontSize: 11, color: COLORS.slateMuted, fontWeight: '600' },
-  infoValue: { fontSize: 14, color: COLORS.slate, fontWeight: '600', marginTop: 2 },
-  block: { marginTop: 20 },
-  blockTitle: { fontSize: 14, fontWeight: '800', color: COLORS.slate, marginBottom: 10 },
-  table: {
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: 10,
-    overflow: 'hidden',
-    backgroundColor: COLORS.white,
-  },
-  tableHeader: { backgroundColor: COLORS.primaryLight },
-  tableHeaderText: { fontWeight: '800', color: COLORS.primary },
-  tableRow: {
-    flexDirection: 'row',
-    borderBottomWidth: 1,
-    borderBottomColor: '#F1F5F9',
-  },
-  tableCell: {
-    flex: 1,
-    fontSize: 11,
-    color: COLORS.slate,
-    paddingVertical: 8,
-    paddingHorizontal: 4,
-    textAlign: 'center',
-  },
-  readingStats: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
-  readingStatTile: {
-    flex: 1,
-    minWidth: '30%',
-    padding: 10,
-    borderRadius: 10,
-    backgroundColor: COLORS.background,
-    alignItems: 'center',
-  },
-  readingStatLabel: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: COLORS.slateMuted,
-    textTransform: 'uppercase',
-  },
-  readingStatValue: { fontSize: 14, fontWeight: '800', marginTop: 4 },
-  noteBox: { padding: 12, borderRadius: 10, marginTop: 6 },
-  noteLabel: { fontSize: 11, fontWeight: '800', marginBottom: 4 },
-  noteText: { fontSize: 13, color: COLORS.slate },
-  committeeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: '#F1F5F9',
-  },
-  committeeName: { fontSize: 13, fontWeight: '600', color: COLORS.slate, flex: 1 },
-  committeeLine: {
-    flex: 1,
-    height: 1,
-    borderBottomWidth: 1,
-    borderStyle: 'dashed',
-    borderBottomColor: COLORS.gray,
-  },
-  modalActions: {
-    flexDirection: 'row',
-    padding: 16,
-    gap: 8,
-    borderTopWidth: 1,
-    borderTopColor: COLORS.border,
     flexWrap: 'wrap',
+    gap: 8,
   },
-  actionBtnOutline: {
-    flex: 1,
-    minWidth: 90,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 12,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    borderColor: COLORS.primary,
-    gap: 6,
-  },
-  actionBtnOutlineText: { fontSize: 13, fontWeight: '700', color: COLORS.primary },
-  actionBtnDanger: {
-    flex: 1,
-    minWidth: 90,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 12,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    borderColor: COLORS.red,
-    gap: 6,
-  },
-  actionBtnDangerText: { fontSize: 13, fontWeight: '700', color: COLORS.red },
-  formLabel: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: COLORS.slateMuted,
-    marginTop: 14,
-    marginBottom: 6,
-    textTransform: 'uppercase',
-    letterSpacing: 0.3,
-  },
-  formInput: {
-    borderWidth: 1,
-    borderColor: COLORS.border,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 14,
-    color: COLORS.slate,
-    backgroundColor: COLORS.white,
-  },
-  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6 },
-  typeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
+  sheetChip: {
+    paddingHorizontal: 14,
+    paddingVertical: 9,
     borderRadius: 999,
     backgroundColor: COLORS.background,
     borderWidth: 1,
     borderColor: COLORS.border,
   },
-  typeRowText: { fontSize: 12, fontWeight: '700', color: COLORS.slate },
-  addTypeRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 12 },
-  addTypeBtn: {
-    width: 44,
-    height: 44,
-    borderRadius: 12,
+  sheetChipActive: {
     backgroundColor: COLORS.primary,
-    alignItems: 'center',
-    justifyContent: 'center',
+    borderColor: COLORS.primary,
   },
-  cancelBtn: {
+  sheetChipText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.slateMuted,
+  },
+  sheetChipTextActive: {
+    color: '#fff',
+  },
+  sheetFooter: {
+    flexDirection: 'row',
+    gap: 10,
+    padding: 16,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.border,
+  },
+  sheetClearBtn: {
     flex: 1,
     paddingVertical: 12,
     borderRadius: 12,
@@ -1560,16 +1436,24 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.border,
   },
-  cancelBtnText: { fontSize: 14, fontWeight: '700', color: COLORS.slate },
-  saveBtn: {
+  sheetClearBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.slate,
+  },
+  sheetApplyBtn: {
     flex: 2,
     flexDirection: 'row',
-    gap: 6,
     paddingVertical: 12,
     borderRadius: 12,
     backgroundColor: COLORS.primary,
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 6,
   },
-  saveBtnText: { fontSize: 14, fontWeight: '700', color: '#fff' },
+  sheetApplyBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#fff',
+  },
 });

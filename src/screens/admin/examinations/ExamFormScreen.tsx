@@ -1,5 +1,5 @@
 // src/screens/admin/examinations/ExamFormScreen.tsx
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   View,
   Text,
@@ -9,9 +9,9 @@ import {
   ActivityIndicator,
   StyleSheet,
   Alert,
-  KeyboardAvoidingView,
   Platform,
 } from 'react-native';
+import { KeyboardAwareScreen } from '../../../components/common/KeyboardAwareScreen';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useTranslation } from 'react-i18next';
@@ -27,24 +27,34 @@ import {
   MarksPer,
   ReadingWritingHeader,
   ReadingWritingWeights,
+  ReadingCategory,
   StudentLite,
+  READING_CATEGORIES,
   DEFAULT_COLUMNS,
   DEFAULT_EXAM_TYPES,
   DEFAULT_MARKS_PER,
   DEFAULT_READING_HEADERS,
   DEFAULT_READING_WEIGHTS,
+  DEFAULT_ENABLED_CATEGORIES,
   api,
   getExamFormType,
   getVisibleColumns,
   getJuzName,
   getSurahName,
   round2,
+  getEnabledSkillHeaders,
+  getEnabledCategories,
+  getEffectiveWeights,
+  getEffectiveMaxTotal,
+  calculateExactSkillMaxes,
+  calculateCategoryTotal,
+  calculateGrandTotal,
   SURAH_LIST,
   JUZ_NAMES,
 } from './_shared';
 
 // ============================================================
-// HELPERS
+// MODULE-LEVEL HELPERS
 // ============================================================
 const getEmptyQuestion = (n: number): ExamQuestion => ({
   questionNumber: n,
@@ -78,9 +88,35 @@ const buildEmptyForm = (settings: ExamSettings | null): ExamFormState => {
   };
 };
 
-const ORDINAL_KEYS = [
-  '1', '2', '3', '4', '5', '6', '7', '8', '9', '10',
-];
+const ORDINAL_KEYS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10'];
+
+/** Build a fresh "everything enabled" toggles object from a header list. */
+const buildDefaultEnabledSkills = (
+  headers: ReadingWritingHeader[]
+): Record<string, boolean> => {
+  const out: Record<string, boolean> = {};
+  headers.forEach((h) => {
+    if (
+      h.id !== 'total' &&
+      h.id !== 'estimation' &&
+      h.id !== 'readingScore' &&
+      h.id !== 'writingScore' &&
+      h.id !== 'hijaa' &&
+      h.id !== 'ayahs'
+    ) {
+      out[h.id] = true;
+    }
+  });
+  return out;
+};
+
+/** "Abdullah Ahmed" → "AA"; single-word "Maryam" → "MA". */
+const getInitials = (name?: string): string => {
+  const parts = (name || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return '?';
+  if (parts.length === 1) return parts[0].substring(0, 2).toUpperCase();
+  return (parts[0][0] + parts[1][0]).toUpperCase();
+};
 
 // ============================================================
 // MAIN FORM SCREEN
@@ -106,13 +142,29 @@ export const ExamFormScreen: React.FC<{
   const [readingWeights, setReadingWeights] = useState<ReadingWritingWeights>(
     settings?.readingWritingWeights || DEFAULT_READING_WEIGHTS
   );
-  const [dateType, setDateType] = useState<'gregorian' | 'hijri' | 'both'>('gregorian');
+  const [enabledSkills, setEnabledSkills] = useState<Record<string, boolean>>(
+    buildDefaultEnabledSkills(
+      settings?.readingWritingHeaders || DEFAULT_READING_HEADERS
+    )
+  );
+  const [enabledCategories, setEnabledCategories] = useState<
+    Partial<Record<ReadingCategory, boolean>>
+  >({ ...DEFAULT_ENABLED_CATEGORIES });
+  const [dateType, setDateType] = useState<'gregorian' | 'hijri' | 'both'>(
+    'gregorian'
+  );
 
   const [halaqat, setHalaqat] = useState<Halaqah[]>([]);
   const [students, setStudents] = useState<StudentLite[]>([]);
   const [saving, setSaving] = useState(false);
   const [loadingStudents, setLoadingStudents] = useState(false);
 
+  // -------- NEW: student search --------
+  const [studentSearch, setStudentSearch] = useState('');
+
+  // ----------------------------------------------------------------
+  // Load halaqat once
+  // ----------------------------------------------------------------
   useEffect(() => {
     (async () => {
       try {
@@ -124,20 +176,28 @@ export const ExamFormScreen: React.FC<{
     })();
   }, []);
 
+  // ----------------------------------------------------------------
+  // Hydrate from exam (edit) or reset (create)
+  // ----------------------------------------------------------------
   useEffect(() => {
     if (!exam) {
       setForm(buildEmptyForm(settings));
       setMarksPer(settings ? { ...DEFAULT_MARKS_PER } : DEFAULT_MARKS_PER);
-      setReadingHeaders(settings?.readingWritingHeaders || DEFAULT_READING_HEADERS);
+      const headers = settings?.readingWritingHeaders || DEFAULT_READING_HEADERS;
+      setReadingHeaders(headers);
       setReadingWeights(settings?.readingWritingWeights || DEFAULT_READING_WEIGHTS);
+      setEnabledSkills(buildDefaultEnabledSkills(headers));
+      setEnabledCategories({ ...DEFAULT_ENABLED_CATEGORIES });
       setFormType('memorization');
       setDateType('gregorian');
+      setStudentSearch('');
       return;
     }
 
     const formTypeRaw: ExamFormType = getExamFormType(exam);
     setFormType(formTypeRaw);
 
+    // Date hydration
     let gregorian = exam.dateGregorian || '';
     let hijri = exam.dateHijri || '';
     let dtype: 'gregorian' | 'hijri' | 'both' = exam.dateType || 'gregorian';
@@ -162,6 +222,7 @@ export const ExamFormScreen: React.FC<{
     }
     setDateType(dtype);
 
+    // Normalize questions' customColumns
     const questions: ExamQuestion[] = (exam.questions || []).map((q) => {
       if (q.customColumns && typeof q.customColumns === 'object') {
         return { ...q };
@@ -210,21 +271,59 @@ export const ExamFormScreen: React.FC<{
       totalMarks: exam.totalMarks || 100,
     });
 
-    setMarksPer(exam.marksPer || settings?.passingMark ? { ...DEFAULT_MARKS_PER } : DEFAULT_MARKS_PER);
+    // Hydrate marksPer
     if (exam.marksPer) setMarksPer(exam.marksPer);
-    if (exam.readingWritingHeaders) setReadingHeaders(exam.readingWritingHeaders);
+    else setMarksPer(DEFAULT_MARKS_PER);
+
+    // Hydrate headers / weights
+    const headers =
+      exam.readingWritingHeaders ||
+      settings?.readingWritingHeaders ||
+      DEFAULT_READING_HEADERS;
+    setReadingHeaders(headers);
+
     if (exam.readingWritingWeights) setReadingWeights(exam.readingWritingWeights);
+    else if (settings?.readingWritingWeights)
+      setReadingWeights(settings.readingWritingWeights);
+    else setReadingWeights(DEFAULT_READING_WEIGHTS);
+
+    // Hydrate toggles
+    if (exam.enabledSkills) {
+      const merged: Record<string, boolean> = buildDefaultEnabledSkills(headers);
+      Object.keys(exam.enabledSkills).forEach((k) => {
+        merged[k] = exam.enabledSkills![k];
+      });
+      setEnabledSkills(merged);
+    } else {
+      setEnabledSkills(buildDefaultEnabledSkills(headers));
+    }
+
+    if (exam.enabledCategories) {
+      setEnabledCategories({
+        ...DEFAULT_ENABLED_CATEGORIES,
+        ...exam.enabledCategories,
+      });
+    } else {
+      setEnabledCategories({ ...DEFAULT_ENABLED_CATEGORIES });
+    }
+
+    setStudentSearch('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [exam]);
 
+  // ----------------------------------------------------------------
+  // Load students when halaqah changes
+  // ----------------------------------------------------------------
   useEffect(() => {
     const halaqah = form.halaqah;
     if (!halaqah) {
       setStudents([]);
+      setStudentSearch('');
       return;
     }
     (async () => {
       setLoadingStudents(true);
+      setStudentSearch('');
       try {
         const list = await api.getStudentsByHalaqah(halaqah);
         setStudents(list);
@@ -242,6 +341,9 @@ export const ExamFormScreen: React.FC<{
     })();
   }, [form.halaqah]);
 
+  // ----------------------------------------------------------------
+  // Basic updaters
+  // ----------------------------------------------------------------
   const update = <K extends keyof ExamFormState>(
     key: K,
     value: ExamFormState[K]
@@ -323,39 +425,58 @@ export const ExamFormScreen: React.FC<{
     setMarksPer((prev) => ({ ...prev, [key]: value }));
   };
 
+  // ----------------------------------------------------------------
+  // Reading toggles
+  // ----------------------------------------------------------------
+  const toggleSkill = (skillId: string) => {
+    setEnabledSkills((prev) => ({ ...prev, [skillId]: !prev[skillId] }));
+  };
+
+  const toggleCategory = (category: ReadingCategory) => {
+    setEnabledCategories((prev) => ({
+      ...prev,
+      [category]: !(prev[category] !== false),
+    }));
+  };
+
+  // ----------------------------------------------------------------
+  // Reading weights — clamp against ENABLED categories only
+  // ----------------------------------------------------------------
   const updateReadingWeight = (
     key: keyof ReadingWritingWeights,
-    value: number
+    rawValue: number
   ) => {
     setReadingWeights((prev) => {
-      const totalWithoutCurrent = Object.entries(prev)
-        .filter(([k]) => k !== key)
-        .reduce((sum, [, v]) => sum + (v || 0), 0);
-      const maxTotal = form.totalMarks || 100;
-      if (totalWithoutCurrent + value > maxTotal) {
-        const clamped = Math.max(0, maxTotal - totalWithoutCurrent);
-        return { ...prev, [key]: clamped };
-      }
-      return { ...prev, [key]: value };
+      const totalMarks = form.totalMarks || 100;
+      const otherEnabledTotal = READING_CATEGORIES.filter(
+        (cat) => cat !== key && enabledCategories[cat] !== false
+      ).reduce((sum, cat) => sum + (prev[cat] || 0), 0);
+
+      const maxForThis = Math.max(0, round2(totalMarks - otherEnabledTotal));
+      const clamped = Math.max(0, Math.min(rawValue, maxForThis));
+      return { ...prev, [key]: round2(clamped) };
     });
   };
 
+  // ----------------------------------------------------------------
+  // Reading per-skill score updates
+  // ----------------------------------------------------------------
   const updateReadingScore = (
     key: string,
-    value: number | string,
+    rawValue: number | string,
     maxVal: number
   ) => {
     setForm((prev) => {
-      if (value === '') {
+      if (rawValue === '') {
         return {
           ...prev,
           readingWritingScores: { ...prev.readingWritingScores, [key]: '' },
         };
       }
-      const num = parseFloat(String(value));
+      const num = parseFloat(String(rawValue));
       if (isNaN(num)) return prev;
       const clamped = Math.max(0, Math.min(num, maxVal));
-      const rounded = Math.round(clamped * 10) / 10;
+      const rounded = Math.round(clamped * 100) / 100;
       return {
         ...prev,
         readingWritingScores: {
@@ -366,6 +487,102 @@ export const ExamFormScreen: React.FC<{
     });
   };
 
+  const incrementReadingScore = (key: string, maxVal: number) => {
+    const cur = parseFloat(String(form.readingWritingScores[key] ?? 0)) || 0;
+    updateReadingScore(key, round2(Math.min(cur + 0.1, maxVal)), maxVal);
+  };
+
+  const decrementReadingScore = (key: string, maxVal: number) => {
+    const cur = parseFloat(String(form.readingWritingScores[key] ?? 0)) || 0;
+    updateReadingScore(key, round2(Math.max(cur - 0.1, 0)), maxVal);
+  };
+
+  // ----------------------------------------------------------------
+  // "Fill All Scores" — set every enabled skill/category to its exact max
+  // ----------------------------------------------------------------
+  const handleFillAllScores = () => {
+    const enabledSkillsList = getEnabledSkillHeaders(readingHeaders, enabledSkills);
+    const effectiveWeights = getEffectiveWeights(readingWeights, enabledCategories);
+    const exact = calculateExactSkillMaxes(enabledSkillsList, effectiveWeights);
+
+    const next: Record<string, number | string> = {
+      ...form.readingWritingScores,
+    };
+
+    enabledSkillsList.forEach((h, idx) => {
+      const rMax =
+        enabledCategories.readingScore !== false ? exact.reading[idx] || 0 : 0;
+      const wMax =
+        enabledCategories.writingScore !== false ? exact.writing[idx] || 0 : 0;
+      const hjMax =
+        enabledCategories.hijaa !== false ? exact.hijaa[idx] || 0 : 0;
+      const ayMax =
+        enabledCategories.ayahs !== false ? exact.ayahs[idx] || 0 : 0;
+
+      if (enabledCategories.readingScore !== false)
+        next[`${h.id}_reading`] = rMax;
+      if (enabledCategories.writingScore !== false)
+        next[`${h.id}_writing`] = wMax;
+      if (enabledCategories.hijaa !== false) next[`${h.id}_hijaa`] = hjMax;
+      if (enabledCategories.ayahs !== false) next[`${h.id}_ayahs`] = ayMax;
+    });
+
+    setForm((prev) => ({ ...prev, readingWritingScores: next }));
+  };
+
+  // ----------------------------------------------------------------
+  // "Fill All Weights" — distribute totalMarks across enabled categories
+  // ----------------------------------------------------------------
+  const handleFillAllWeights = () => {
+    const totalMarks = form.totalMarks || 100;
+    const enabledCats = getEnabledCategories(enabledCategories);
+
+    if (enabledCats.length === 0) return;
+
+    const currentEnabledTotal = enabledCats.reduce(
+      (sum, cat) => sum + (readingWeights[cat] || 0),
+      0
+    );
+
+    const next: ReadingWritingWeights = { ...readingWeights };
+
+    if (currentEnabledTotal > 0) {
+      const rawShares = enabledCats.map(
+        (cat) => ((readingWeights[cat] || 0) / currentEnabledTotal) * totalMarks
+      );
+      const cents = rawShares.map((v) => Math.floor(round2(v) * 100));
+      const usedCents = cents.reduce((s, c) => s + c, 0);
+      const remainder = Math.round(totalMarks * 100) - usedCents;
+      if (remainder > 0) {
+        const order = cents
+          .map((c, i) => ({ i, frac: rawShares[i] * 100 - c }))
+          .sort((a, b) => b.frac - a.frac);
+        for (let k = 0; k < remainder; k++) {
+          cents[order[k % order.length].i] += 1;
+        }
+      }
+      enabledCats.forEach((cat, i) => {
+        next[cat] = cents[i] / 100;
+      });
+    } else {
+      const totalCents = Math.round(totalMarks * 100);
+      const baseCents = Math.floor(totalCents / enabledCats.length);
+      const remainder = totalCents - baseCents * enabledCats.length;
+      enabledCats.forEach((cat, i) => {
+        next[cat] = (baseCents + (i === 0 ? remainder : 0)) / 100;
+      });
+    }
+
+    READING_CATEGORIES.forEach((cat) => {
+      if (enabledCategories[cat] === false) next[cat] = 0;
+    });
+
+    setReadingWeights(next);
+  };
+
+  // ----------------------------------------------------------------
+  // Derived — memorization
+  // ----------------------------------------------------------------
   const visibleColumns = useMemo(() => getVisibleColumns(settings), [settings]);
 
   const totalDeduction = useMemo(() => {
@@ -397,48 +614,83 @@ export const ExamFormScreen: React.FC<{
     return round2(obtained);
   }, [form.totalMarks, totalDeduction]);
 
+  // ----------------------------------------------------------------
+  // Derived — Reading
+  // ----------------------------------------------------------------
+  const enabledSkillsList = useMemo(
+    () => getEnabledSkillHeaders(readingHeaders, enabledSkills),
+    [readingHeaders, enabledSkills]
+  );
+
+  const enabledCatsList = useMemo(
+    () => getEnabledCategories(enabledCategories),
+    [enabledCategories]
+  );
+
+  const effectiveWeights = useMemo(
+    () => getEffectiveWeights(readingWeights, enabledCategories),
+    [readingWeights, enabledCategories]
+  );
+
+  const exactSkillMaxes = useMemo(
+    () => calculateExactSkillMaxes(enabledSkillsList, effectiveWeights),
+    [enabledSkillsList, effectiveWeights]
+  );
+
   const readingTotals = useMemo(() => {
-    const skillHeaders = readingHeaders.filter(
-      (h) =>
-        h.id !== 'total' &&
-        h.id !== 'estimation' &&
-        h.id !== 'readingScore' &&
-        h.id !== 'writingScore' &&
-        h.id !== 'hijaa' &&
-        h.id !== 'ayahs'
+    const readingTotal = calculateCategoryTotal(
+      form.readingWritingScores,
+      enabledSkillsList,
+      'readingScore'
     );
-    let readingTotal = 0,
-      writingTotal = 0,
-      hijaaTotal = 0,
-      ayahsTotal = 0;
-    skillHeaders.forEach((h) => {
-      readingTotal +=
-        parseFloat(String(form.readingWritingScores[`${h.id}_reading`] ?? 0)) || 0;
-      writingTotal +=
-        parseFloat(String(form.readingWritingScores[`${h.id}_writing`] ?? 0)) || 0;
-      hijaaTotal +=
-        parseFloat(String(form.readingWritingScores[`${h.id}_hijaa`] ?? 0)) || 0;
-      ayahsTotal +=
-        parseFloat(String(form.readingWritingScores[`${h.id}_ayahs`] ?? 0)) || 0;
-    });
-    const grandTotal = readingTotal + writingTotal + hijaaTotal + ayahsTotal;
-    const maxTotal =
-      (readingWeights.readingScore || 0) +
-      (readingWeights.writingScore || 0) +
-      (readingWeights.hijaa || 0) +
-      (readingWeights.ayahs || 0);
+    const writingTotal = calculateCategoryTotal(
+      form.readingWritingScores,
+      enabledSkillsList,
+      'writingScore'
+    );
+    const hijaaTotal = calculateCategoryTotal(
+      form.readingWritingScores,
+      enabledSkillsList,
+      'hijaa'
+    );
+    const ayahsTotal = calculateCategoryTotal(
+      form.readingWritingScores,
+      enabledSkillsList,
+      'ayahs'
+    );
+    const grandTotal = round2(
+      readingTotal + writingTotal + hijaaTotal + ayahsTotal
+    );
+    const maxTotal = getEffectiveMaxTotal(readingWeights, enabledCategories);
     const pct = maxTotal > 0 ? (grandTotal / maxTotal) * 100 : 0;
     return {
-      readingTotal: round2(readingTotal),
-      writingTotal: round2(writingTotal),
-      hijaaTotal: round2(hijaaTotal),
-      ayahsTotal: round2(ayahsTotal),
-      grandTotal: round2(grandTotal),
-      maxTotal: round2(maxTotal),
+      readingTotal,
+      writingTotal,
+      hijaaTotal,
+      ayahsTotal,
+      grandTotal,
+      maxTotal,
       percentage: round2(pct),
     };
-  }, [readingHeaders, form.readingWritingScores, readingWeights]);
+  }, [
+    form.readingWritingScores,
+    enabledSkillsList,
+    readingWeights,
+    enabledCategories,
+  ]);
 
+  // ----------------------------------------------------------------
+  // Derived — filtered students (NEW)
+  // ----------------------------------------------------------------
+  const filteredStudents = useMemo(() => {
+    if (!studentSearch.trim()) return students;
+    const q = studentSearch.toLowerCase().trim();
+    return students.filter((s) => s.name.toLowerCase().includes(q));
+  }, [students, studentSearch]);
+
+  // ----------------------------------------------------------------
+  // Save
+  // ----------------------------------------------------------------
   const handleSave = async () => {
     if (!form.halaqah) {
       Alert.alert(
@@ -475,12 +727,10 @@ export const ExamFormScreen: React.FC<{
       let computedObtained = obtainedMarks;
 
       if (formType === 'reading') {
-        const max =
-          readingWeights.readingScore +
-          readingWeights.writingScore +
-          readingWeights.hijaa +
-          readingWeights.ayahs;
-        computedTotalMarks = max || 100;
+        computedTotalMarks = getEffectiveMaxTotal(
+          readingWeights,
+          enabledCategories
+        );
         computedObtained = readingTotals.grandTotal;
       }
 
@@ -553,6 +803,9 @@ export const ExamFormScreen: React.FC<{
           formType === 'reading' ? cleanReadingScores : undefined,
         readingWritingWeights:
           formType === 'reading' ? readingWeights : undefined,
+        enabledSkills: formType === 'reading' ? enabledSkills : undefined,
+        enabledCategories:
+          formType === 'reading' ? enabledCategories : undefined,
         totalMarks: computedTotalMarks,
         passingMark,
         notes: form.notes,
@@ -605,6 +858,9 @@ export const ExamFormScreen: React.FC<{
     return t('examinations.form.grades.poor');
   };
 
+  // ============================================================
+  // RENDER
+  // ============================================================
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
       {/* HEADER */}
@@ -626,16 +882,10 @@ export const ExamFormScreen: React.FC<{
         </View>
       </View>
 
-      <KeyboardAvoidingView
-        style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      <KeyboardAwareScreen
+        contentContainerStyle={styles.body}
+        extraBottomOffset={90}
       >
-        <ScrollView
-          style={styles.body}
-          contentContainerStyle={{ paddingBottom: 24 }}
-          keyboardShouldPersistTaps="handled"
-          showsVerticalScrollIndicator={false}
-        >
           {/* FORM TYPE */}
           <Text style={styles.sectionTitle}>
             {t('examinations.form.sectionFormType')}
@@ -701,34 +951,182 @@ export const ExamFormScreen: React.FC<{
             )}
           </View>
 
+          {/* ================================================================
+              STUDENT PICKER (professional)
+          ================================================================ */}
           {form.halaqah ? (
             <>
-              <Text style={styles.label}>{t('examinations.form.student')}</Text>
+              <Text style={styles.label}>
+                {t('examinations.form.student')}
+              </Text>
+
               {loadingStudents ? (
-                <ActivityIndicator size="small" color={COLORS.primary} />
+                <View style={styles.studentLoadingWrap}>
+                  <ActivityIndicator size="small" color={COLORS.primary} />
+                  <Text style={styles.studentLoadingText}>
+                    {t('examinations.form.loadingStudents') ||
+                      'Loading students…'}
+                  </Text>
+                </View>
               ) : students.length === 0 ? (
-                <Text style={styles.hint}>{t('examinations.form.noStudents')}</Text>
+                <View style={styles.studentEmptyWrap}>
+                  <Ionicons
+                    name="people-outline"
+                    size={28}
+                    color={COLORS.gray}
+                  />
+                  <Text style={styles.studentEmptyText}>
+                    {t('examinations.form.noStudents')}
+                  </Text>
+                </View>
+              ) : form.studentId && form.studentName ? (
+                // -------- SELECTED STUDENT CARD --------
+                <View style={styles.selectedStudentCard}>
+                  <View style={styles.selectedStudentAvatar}>
+                    <Text style={styles.selectedStudentAvatarText}>
+                      {getInitials(form.studentName)}
+                    </Text>
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text
+                      style={styles.selectedStudentName}
+                      numberOfLines={1}
+                    >
+                      {form.studentName}
+                    </Text>
+                    <Text
+                      style={styles.selectedStudentMeta}
+                      numberOfLines={1}
+                    >
+                      {t('examinations.form.selected') || 'Selected student'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={styles.selectedStudentChangeBtn}
+                    onPress={() => {
+                      update('studentId', '');
+                      update('studentName', '');
+                    }}
+                  >
+                    <Ionicons
+                      name="swap-horizontal"
+                      size={14}
+                      color={COLORS.primary}
+                    />
+                    <Text style={styles.selectedStudentChangeBtnText}>
+                      {t('examinations.form.change') || 'Change'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
               ) : (
-                <View style={styles.chipRow}>
-                  {students.map((s) => {
-                    const active = form.studentId === s._id;
-                    return (
-                      <TouchableOpacity
-                        key={s._id}
-                        style={[styles.chip, active && styles.chipActive]}
-                        onPress={() => {
-                          update('studentId', s._id);
-                          update('studentName', s.name);
-                        }}
-                      >
-                        <Text
-                          style={[styles.chipText, active && styles.chipTextActive]}
-                        >
-                          {s.name}
-                        </Text>
+                // -------- SEARCH + LIST PICKER --------
+                <View>
+                  <View style={styles.studentSearchWrapper}>
+                    <Ionicons
+                      name="search-outline"
+                      size={16}
+                      color={COLORS.gray}
+                    />
+                    <TextInput
+                      style={styles.studentSearchInput}
+                      value={studentSearch}
+                      onChangeText={setStudentSearch}
+                      placeholder={
+                        t('examinations.form.searchStudent') ||
+                        'Search student…'
+                      }
+                      placeholderTextColor="#A0AAA5"
+                    />
+                    {studentSearch.length > 0 && (
+                      <TouchableOpacity onPress={() => setStudentSearch('')}>
+                        <Ionicons
+                          name="close-circle"
+                          size={16}
+                          color={COLORS.gray}
+                        />
                       </TouchableOpacity>
-                    );
-                  })}
+                    )}
+                  </View>
+
+                  <Text style={styles.studentCountHint}>
+                    {filteredStudents.length}{' '}
+                    {t('examinations.form.studentsCount') || 'students'}
+                  </Text>
+
+                  <View style={styles.studentListContainer}>
+                    <ScrollView
+                      style={styles.studentListScroll}
+                      nestedScrollEnabled
+                      keyboardShouldPersistTaps="handled"
+                      showsVerticalScrollIndicator
+                    >
+                      {filteredStudents.length === 0 ? (
+                        <View style={styles.studentNoMatchWrap}>
+                          <Ionicons
+                            name="search-outline"
+                            size={20}
+                            color={COLORS.gray}
+                          />
+                          <Text style={styles.studentNoMatchText}>
+                            {t('examinations.form.noSearchResults') ||
+                              'No students match your search'}
+                          </Text>
+                        </View>
+                      ) : (
+                        filteredStudents.map((s) => {
+                          const active = form.studentId === s._id;
+                          return (
+                            <TouchableOpacity
+                              key={s._id}
+                              style={[
+                                styles.studentRow,
+                                active && styles.studentRowActive,
+                              ]}
+                              onPress={() => {
+                                update('studentId', s._id);
+                                update('studentName', s.name);
+                                setStudentSearch('');
+                              }}
+                              activeOpacity={0.7}
+                            >
+                              <View
+                                style={[
+                                  styles.studentRowAvatar,
+                                  active && styles.studentRowAvatarActive,
+                                ]}
+                              >
+                                <Text
+                                  style={[
+                                    styles.studentRowAvatarText,
+                                    active &&
+                                      styles.studentRowAvatarTextActive,
+                                  ]}
+                                >
+                                  {getInitials(s.name)}
+                                </Text>
+                              </View>
+                              <Text
+                                style={[
+                                  styles.studentRowName,
+                                  active && styles.studentRowNameActive,
+                                ]}
+                                numberOfLines={1}
+                              >
+                                {s.name}
+                              </Text>
+                              {active && (
+                                <Ionicons
+                                  name="checkmark-circle"
+                                  size={18}
+                                  color={COLORS.primary}
+                                />
+                              )}
+                            </TouchableOpacity>
+                          );
+                        })
+                      )}
+                    </ScrollView>
+                  </View>
                 </View>
               )}
             </>
@@ -953,7 +1351,9 @@ export const ExamFormScreen: React.FC<{
             </>
           )}
 
-          {/* MEMORIZATION: QUESTION BREAKDOWN */}
+          {/* ================================================================
+              MEMORIZATION: QUESTION BREAKDOWN
+          ================================================================ */}
           {formType === 'memorization' && (
             <>
               <View style={styles.sectionHeaderRow}>
@@ -1136,9 +1536,7 @@ export const ExamFormScreen: React.FC<{
                       styles.grandValue,
                       {
                         color:
-                          totalDeduction > 0
-                            ? COLORS.red
-                            : COLORS.primary,
+                          totalDeduction > 0 ? COLORS.red : COLORS.primary,
                       },
                     ]}
                   >
@@ -1157,41 +1555,119 @@ export const ExamFormScreen: React.FC<{
             </>
           )}
 
-          {/* READING & WRITING */}
+          {/* ================================================================
+              READING & WRITING
+          ================================================================ */}
           {formType === 'reading' && (
             <>
               <Text style={styles.sectionTitle}>
                 {t('examinations.form.sectionReading')}
               </Text>
 
+              {/* Category weights + Fill All Weights button */}
               <View style={styles.weightsCard}>
-                <Text style={styles.weightsTitle}>
-                  {t('examinations.form.categoryWeights')}
-                </Text>
+                <View style={styles.weightsCardHeader}>
+                  <Text style={styles.weightsTitle}>
+                    {t('examinations.form.categoryWeights')}
+                  </Text>
+                  <TouchableOpacity
+                    style={styles.fillBtn}
+                    onPress={handleFillAllWeights}
+                  >
+                    <Ionicons name="arrow-up" size={12} color={COLORS.purple} />
+                    <Text style={styles.fillBtnText}>
+                      {t('examinations.form.fillAllWeights') || 'Fill All'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+
                 <View style={styles.weightsGrid}>
-                  {(
-                    [
-                      'readingScore',
-                      'writingScore',
-                      'hijaa',
-                      'ayahs',
-                    ] as (keyof ReadingWritingWeights)[]
-                  ).map((k) => (
-                    <View key={k} style={styles.weightItem}>
-                      <Text style={styles.weightLabel}>
-                        {k.replace('Score', '')}
-                      </Text>
-                      <TextInput
-                        style={styles.weightInput}
-                        value={String(readingWeights[k] ?? 0)}
-                        onChangeText={(v) => {
-                          const n = parseFloat(v.replace(/[^0-9.]/g, '')) || 0;
-                          updateReadingWeight(k, n);
-                        }}
-                        keyboardType="numeric"
-                      />
-                    </View>
-                  ))}
+                  {READING_CATEGORIES.map((k) => {
+                    const catEnabled = enabledCategories[k] !== false;
+                    const otherEnabledTotal = READING_CATEGORIES.filter(
+                      (cat) => cat !== k && enabledCategories[cat] !== false
+                    ).reduce((sum, cat) => sum + (readingWeights[cat] || 0), 0);
+                    const maxForThis = catEnabled
+                      ? Math.max(
+                          0,
+                          round2((form.totalMarks || 100) - otherEnabledTotal)
+                        )
+                      : 0;
+                    return (
+                      <View key={k} style={styles.weightItem}>
+                        <TouchableOpacity
+                          style={styles.weightToggleRow}
+                          onPress={() => toggleCategory(k)}
+                        >
+                          <Ionicons
+                            name={catEnabled ? 'checkbox' : 'square-outline'}
+                            size={14}
+                            color={catEnabled ? COLORS.purple : COLORS.gray}
+                          />
+                          <Text
+                            style={[
+                              styles.weightLabel,
+                              !catEnabled && {
+                                textDecorationLine: 'line-through',
+                                color: COLORS.gray,
+                              },
+                            ]}
+                          >
+                            {t(`examinations.form.categories.${k}`) || k}
+                          </Text>
+                        </TouchableOpacity>
+                        <TextInput
+                          style={[
+                            styles.weightInput,
+                            !catEnabled && {
+                              opacity: 0.5,
+                              backgroundColor: COLORS.background,
+                            },
+                          ]}
+                          value={String(readingWeights[k] ?? 0)}
+                          onChangeText={(v) => {
+                            const n = parseFloat(v.replace(/[^0-9.]/g, '')) || 0;
+                            updateReadingWeight(k, n);
+                          }}
+                          keyboardType="numeric"
+                          editable={catEnabled}
+                        />
+                        {catEnabled && (
+                          <Text style={styles.weightMaxHint}>
+                            max {maxForThis}
+                          </Text>
+                        )}
+                      </View>
+                    );
+                  })}
+                </View>
+
+                <View style={styles.weightsTotalRow}>
+                  <Text style={styles.weightsTotalLabel}>
+                    {t('examinations.form.total') || 'Total'}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.weightsTotalValue,
+                      {
+                        color:
+                          getEffectiveMaxTotal(
+                            readingWeights,
+                            enabledCategories
+                          ) === (form.totalMarks || 100)
+                            ? COLORS.primary
+                            : getEffectiveMaxTotal(
+                                readingWeights,
+                                enabledCategories
+                              ) > (form.totalMarks || 100)
+                            ? COLORS.red
+                            : COLORS.amber,
+                      },
+                    ]}
+                  >
+                    {getEffectiveMaxTotal(readingWeights, enabledCategories)} /{' '}
+                    {form.totalMarks || 100}
+                  </Text>
                 </View>
                 <Text style={styles.weightsHint}>
                   {t('examinations.form.weightsHint', {
@@ -1200,6 +1676,23 @@ export const ExamFormScreen: React.FC<{
                 </Text>
               </View>
 
+              {/* Skills header + Fill All Scores button */}
+              <View style={styles.skillsSectionHeader}>
+                <Text style={styles.skillsSectionTitle}>
+                  {t('examinations.form.skillsAndScores') || 'Skills & Scores'}
+                </Text>
+                <TouchableOpacity
+                  style={styles.fillScoresBtn}
+                  onPress={handleFillAllScores}
+                >
+                  <Ionicons name="checkmark" size={12} color={COLORS.primary} />
+                  <Text style={styles.fillScoresBtnText}>
+                    {t('examinations.form.fillAllScores') || 'Fill All Scores'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              {/* Per-skill cards with toggle + 4 category inputs */}
               {readingHeaders
                 .filter(
                   (h) =>
@@ -1211,145 +1704,226 @@ export const ExamFormScreen: React.FC<{
                     h.id !== 'ayahs'
                 )
                 .map((h) => {
-                  const skillHeaders = readingHeaders.filter(
-                    (x) =>
-                      x.id !== 'total' &&
-                      x.id !== 'estimation' &&
-                      x.id !== 'readingScore' &&
-                      x.id !== 'writingScore' &&
-                      x.id !== 'hijaa' &&
-                      x.id !== 'ayahs'
+                  const skillEnabled = enabledSkills[h.id] !== false;
+                  const skillIdx = enabledSkillsList.findIndex(
+                    (s) => s.id === h.id
                   );
-                  const count = skillHeaders.length || 1;
-                  const readingMax = (readingWeights.readingScore || 0) / count;
-                  const writingMax = (readingWeights.writingScore || 0) / count;
-                  const hijaaMax = (readingWeights.hijaa || 0) / count;
-                  const ayahsMax = (readingWeights.ayahs || 0) / count;
 
-                  const readingVal = form.readingWritingScores[`${h.id}_reading`] ?? 0;
-                  const writingVal = form.readingWritingScores[`${h.id}_writing`] ?? 0;
-                  const hijaaVal = form.readingWritingScores[`${h.id}_hijaa`] ?? 0;
-                  const ayahsVal = form.readingWritingScores[`${h.id}_ayahs`] ?? 0;
+                  const rMax =
+                    enabledCategories.readingScore !== false && skillIdx >= 0
+                      ? exactSkillMaxes.reading[skillIdx] || 0
+                      : 0;
+                  const wMax =
+                    enabledCategories.writingScore !== false && skillIdx >= 0
+                      ? exactSkillMaxes.writing[skillIdx] || 0
+                      : 0;
+                  const hjMax =
+                    enabledCategories.hijaa !== false && skillIdx >= 0
+                      ? exactSkillMaxes.hijaa[skillIdx] || 0
+                      : 0;
+                  const ayMax =
+                    enabledCategories.ayahs !== false && skillIdx >= 0
+                      ? exactSkillMaxes.ayahs[skillIdx] || 0
+                      : 0;
+
+                  const readingVal =
+                    form.readingWritingScores[`${h.id}_reading`] ?? 0;
+                  const writingVal =
+                    form.readingWritingScores[`${h.id}_writing`] ?? 0;
+                  const hijaaVal =
+                    form.readingWritingScores[`${h.id}_hijaa`] ?? 0;
+                  const ayahsVal =
+                    form.readingWritingScores[`${h.id}_ayahs`] ?? 0;
+
+                  const categoryRows: {
+                    cat: ReadingCategory;
+                    suffix: string;
+                    label: string;
+                    val: number | string;
+                    max: number;
+                    color: string;
+                  }[] = [
+                    {
+                      cat: 'readingScore' as const,
+                      suffix: 'reading',
+                      label: t('examinations.reading.reading'),
+                      val: readingVal,
+                      max: rMax,
+                      color: COLORS.blue,
+                    },
+                    {
+                      cat: 'writingScore' as const,
+                      suffix: 'writing',
+                      label: t('examinations.reading.writing'),
+                      val: writingVal,
+                      max: wMax,
+                      color: COLORS.primary,
+                    },
+                    {
+                      cat: 'hijaa' as const,
+                      suffix: 'hijaa',
+                      label: t('examinations.reading.hijaa'),
+                      val: hijaaVal,
+                      max: hjMax,
+                      color: COLORS.amber,
+                    },
+                    {
+                      cat: 'ayahs' as const,
+                      suffix: 'ayahs',
+                      label: t('examinations.reading.ayahs'),
+                      val: ayahsVal,
+                      max: ayMax,
+                      color: COLORS.pink,
+                    },
+                  ].filter((row) => enabledCategories[row.cat] !== false);
 
                   return (
-                    <View key={h.id} style={styles.skillCard}>
-                      <Text style={styles.skillLabel}>{h.label}</Text>
-                      {(
-                        [
-                          [
-                            t('examinations.reading.reading').toLowerCase(),
-                            readingVal,
-                            readingMax,
-                            COLORS.blue,
-                          ],
-                          [
-                            t('examinations.reading.writing').toLowerCase(),
-                            writingVal,
-                            writingMax,
-                            COLORS.primary,
-                          ],
-                          [
-                            t('examinations.reading.hijaa').toLowerCase(),
-                            hijaaVal,
-                            hijaaMax,
-                            COLORS.amber,
-                          ],
-                          [
-                            t('examinations.reading.ayahs').toLowerCase(),
-                            ayahsVal,
-                            ayahsMax,
-                            COLORS.pink,
-                          ],
-                        ] as [string, any, number, string][]
-                      ).map(([cat, val, max, color]) => (
-                        <View key={cat} style={styles.counterRow}>
-                          <Text style={[styles.counterLabel, { color }]}>
-                            {cat.charAt(0).toUpperCase() + cat.slice(1)} (
-                            {round2(max)} max)
-                          </Text>
-                          <View style={styles.counterControls}>
-                            <TouchableOpacity
-                              style={styles.counterBtn}
-                              onPress={() => {
-                                const current =
-                                  typeof val === 'number'
-                                    ? val
-                                    : parseFloat(String(val)) || 0;
-                                const nv = Math.max(0, round2(current - 0.1));
-                                updateReadingScore(`${h.id}_${cat}`, nv, max);
-                              }}
-                            >
-                              <Ionicons
-                                name="remove"
-                                size={14}
-                                color={COLORS.slate}
-                              />
-                            </TouchableOpacity>
-                            <TextInput
-                              style={styles.counterInput}
-                              value={String(val)}
-                              onChangeText={(v) =>
-                                updateReadingScore(`${h.id}_${cat}`, v, max)
-                              }
-                              keyboardType="numeric"
-                            />
-                            <TouchableOpacity
-                              style={styles.counterBtn}
-                              onPress={() => {
-                                const current =
-                                  typeof val === 'number'
-                                    ? val
-                                    : parseFloat(String(val)) || 0;
-                                const nv = Math.min(max, round2(current + 0.1));
-                                updateReadingScore(`${h.id}_${cat}`, nv, max);
-                              }}
-                            >
-                              <Ionicons
-                                name="add"
-                                size={14}
-                                color={COLORS.slate}
-                              />
-                            </TouchableOpacity>
-                          </View>
-                        </View>
-                      ))}
+                    <View
+                      key={h.id}
+                      style={[
+                        styles.skillCard,
+                        !skillEnabled && styles.skillCardDisabled,
+                      ]}
+                    >
+                      <TouchableOpacity
+                        style={styles.skillHeaderRow}
+                        onPress={() => toggleSkill(h.id)}
+                      >
+                        <Ionicons
+                          name={skillEnabled ? 'checkbox' : 'square-outline'}
+                          size={18}
+                          color={skillEnabled ? COLORS.purple : COLORS.gray}
+                        />
+                        <Text
+                          style={[
+                            styles.skillLabel,
+                            !skillEnabled && {
+                              textDecorationLine: 'line-through',
+                              color: COLORS.gray,
+                            },
+                          ]}
+                        >
+                          {h.label}
+                        </Text>
+                      </TouchableOpacity>
+
+                      {skillEnabled &&
+                        categoryRows.map((row) => {
+                          const scoreK = `${h.id}_${row.suffix}`;
+                          const numericVal =
+                            typeof row.val === 'number'
+                              ? row.val
+                              : parseFloat(String(row.val)) || 0;
+                          return (
+                            <View key={row.cat} style={styles.counterRow}>
+                              <Text
+                                style={[
+                                  styles.counterLabel,
+                                  { color: row.color },
+                                ]}
+                              >
+                                {row.label}
+                                <Text style={styles.counterWeight}>
+                                  {' '}
+                                  (max {round2(row.max)})
+                                </Text>
+                              </Text>
+                              <View style={styles.counterControls}>
+                                <TouchableOpacity
+                                  style={styles.counterBtn}
+                                  onPress={() =>
+                                    decrementReadingScore(scoreK, row.max)
+                                  }
+                                >
+                                  <Ionicons
+                                    name="remove"
+                                    size={14}
+                                    color={COLORS.slate}
+                                  />
+                                </TouchableOpacity>
+                                <TextInput
+                                  style={styles.counterInput}
+                                  value={String(numericVal)}
+                                  onChangeText={(v) =>
+                                    updateReadingScore(scoreK, v, row.max)
+                                  }
+                                  keyboardType="numeric"
+                                />
+                                <TouchableOpacity
+                                  style={styles.counterBtn}
+                                  onPress={() =>
+                                    incrementReadingScore(scoreK, row.max)
+                                  }
+                                >
+                                  <Ionicons
+                                    name="add"
+                                    size={14}
+                                    color={COLORS.slate}
+                                  />
+                                </TouchableOpacity>
+                              </View>
+                            </View>
+                          );
+                        })}
+
+                      {skillEnabled && categoryRows.length === 0 && (
+                        <Text style={styles.hint}>
+                          {t('examinations.form.noCategoriesEnabled') ||
+                            'No categories enabled'}
+                        </Text>
+                      )}
                     </View>
                   );
                 })}
 
+              {/* Summary card */}
               <View style={styles.grandTotalCard}>
-                <View style={styles.grandRow}>
-                  <Text style={styles.grandLabel}>
-                    {t('examinations.reading.reading')}
-                  </Text>
-                  <Text style={[styles.grandValue, { color: COLORS.blue }]}>
-                    {readingTotals.readingTotal} / {readingWeights.readingScore}
-                  </Text>
-                </View>
-                <View style={styles.grandRow}>
-                  <Text style={styles.grandLabel}>
-                    {t('examinations.reading.writing')}
-                  </Text>
-                  <Text style={[styles.grandValue, { color: COLORS.primary }]}>
-                    {readingTotals.writingTotal} / {readingWeights.writingScore}
-                  </Text>
-                </View>
-                <View style={styles.grandRow}>
-                  <Text style={styles.grandLabel}>
-                    {t('examinations.reading.hijaa')}
-                  </Text>
-                  <Text style={[styles.grandValue, { color: COLORS.amber }]}>
-                    {readingTotals.hijaaTotal} / {readingWeights.hijaa}
-                  </Text>
-                </View>
-                <View style={styles.grandRow}>
-                  <Text style={styles.grandLabel}>
-                    {t('examinations.reading.ayahs')}
-                  </Text>
-                  <Text style={[styles.grandValue, { color: COLORS.pink }]}>
-                    {readingTotals.ayahsTotal} / {readingWeights.ayahs}
-                  </Text>
-                </View>
+                {enabledCategories.readingScore !== false && (
+                  <View style={styles.grandRow}>
+                    <Text style={styles.grandLabel}>
+                      {t('examinations.reading.reading')}
+                    </Text>
+                    <Text style={[styles.grandValue, { color: COLORS.blue }]}>
+                      {readingTotals.readingTotal} /{' '}
+                      {round2(effectiveWeights.readingScore)}
+                    </Text>
+                  </View>
+                )}
+                {enabledCategories.writingScore !== false && (
+                  <View style={styles.grandRow}>
+                    <Text style={styles.grandLabel}>
+                      {t('examinations.reading.writing')}
+                    </Text>
+                    <Text
+                      style={[styles.grandValue, { color: COLORS.primary }]}
+                    >
+                      {readingTotals.writingTotal} /{' '}
+                      {round2(effectiveWeights.writingScore)}
+                    </Text>
+                  </View>
+                )}
+                {enabledCategories.hijaa !== false && (
+                  <View style={styles.grandRow}>
+                    <Text style={styles.grandLabel}>
+                      {t('examinations.reading.hijaa')}
+                    </Text>
+                    <Text style={[styles.grandValue, { color: COLORS.amber }]}>
+                      {readingTotals.hijaaTotal} /{' '}
+                      {round2(effectiveWeights.hijaa)}
+                    </Text>
+                  </View>
+                )}
+                {enabledCategories.ayahs !== false && (
+                  <View style={styles.grandRow}>
+                    <Text style={styles.grandLabel}>
+                      {t('examinations.reading.ayahs')}
+                    </Text>
+                    <Text style={[styles.grandValue, { color: COLORS.pink }]}>
+                      {readingTotals.ayahsTotal} /{' '}
+                      {round2(effectiveWeights.ayahs)}
+                    </Text>
+                  </View>
+                )}
                 <View style={[styles.grandRow, styles.grandRowTop]}>
                   <Text style={styles.grandLabelBold}>
                     {t('examinations.form.grandTotal')}
@@ -1397,7 +1971,7 @@ export const ExamFormScreen: React.FC<{
             placeholderTextColor="#A0AAA5"
             multiline
           />
-        </ScrollView>
+        </KeyboardAwareScreen>
 
         <View style={styles.footer}>
           <TouchableOpacity
@@ -1427,14 +2001,13 @@ export const ExamFormScreen: React.FC<{
               </>
             )}
           </TouchableOpacity>
-        </View>
-      </KeyboardAvoidingView>
+                </View>
     </SafeAreaView>
   );
 };
 
 // ============================================================
-// STYLES (unchanged)
+// STYLES
 // ============================================================
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
@@ -1458,7 +2031,7 @@ const styles = StyleSheet.create({
   },
   headerTitle: { fontSize: 20, fontWeight: '800', color: COLORS.slate },
   headerSubtitle: { fontSize: 12, color: COLORS.slateMuted, marginTop: 2 },
-  body: { flex: 1, paddingHorizontal: 16 },
+  body: { paddingHorizontal: 16 },
   sectionTitle: {
     fontSize: 14,
     fontWeight: '800',
@@ -1548,26 +2121,222 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+
+  // ---------- Student picker ----------
+  studentLoadingWrap: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 14,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  studentLoadingText: {
+    fontSize: 12,
+    color: COLORS.slateMuted,
+    fontStyle: 'italic',
+  },
+  studentEmptyWrap: {
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 24,
+    borderRadius: 10,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  studentEmptyText: {
+    fontSize: 12,
+    color: COLORS.slateMuted,
+    textAlign: 'center',
+  },
+  selectedStudentCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: COLORS.primaryLight,
+    borderWidth: 1.5,
+    borderColor: COLORS.primary,
+  },
+  selectedStudentAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: COLORS.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  selectedStudentAvatarText: {
+    color: '#fff',
+    fontWeight: '800',
+    fontSize: 15,
+  },
+  selectedStudentName: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: COLORS.slate,
+  },
+  selectedStudentMeta: {
+    fontSize: 11,
+    color: COLORS.slateMuted,
+    marginTop: 2,
+    fontWeight: '600',
+  },
+  selectedStudentChangeBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: COLORS.white,
+    borderWidth: 1,
+    borderColor: COLORS.primary,
+  },
+  selectedStudentChangeBtnText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: COLORS.primary,
+  },
+  studentSearchWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    height: 42,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: COLORS.white,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  studentSearchInput: {
+    flex: 1,
+    fontSize: 13,
+    color: COLORS.slate,
+    paddingVertical: 0,
+  },
+  studentCountHint: {
+    fontSize: 10,
+    color: COLORS.slateMuted,
+    fontWeight: '700',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+    marginTop: 8,
+    marginBottom: 6,
+  },
+  studentListContainer: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    backgroundColor: COLORS.white,
+    overflow: 'hidden',
+  },
+  studentListScroll: {
+    maxHeight: 280,
+  },
+  studentRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
+  },
+  studentRowActive: {
+    backgroundColor: COLORS.primaryLight,
+  },
+  studentRowAvatar: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: COLORS.blueLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  studentRowAvatarActive: {
+    backgroundColor: COLORS.primary,
+  },
+  studentRowAvatarText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: COLORS.blue,
+  },
+  studentRowAvatarTextActive: {
+    color: '#fff',
+  },
+  studentRowName: {
+    flex: 1,
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.slate,
+  },
+  studentRowNameActive: {
+    color: COLORS.primary,
+  },
+  studentNoMatchWrap: {
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 24,
+  },
+  studentNoMatchText: {
+    fontSize: 12,
+    color: COLORS.slateMuted,
+    fontStyle: 'italic',
+  },
+
+  // Weights
   weightsCard: {
     backgroundColor: COLORS.purpleLight,
     borderRadius: 12,
     padding: 12,
     marginBottom: 12,
   },
+  weightsCardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
   weightsTitle: {
     fontSize: 12,
     fontWeight: '800',
     color: COLORS.purple,
-    marginBottom: 8,
   },
+  fillBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: '#EDE9FE',
+  },
+  fillBtnText: { fontSize: 10, fontWeight: '700', color: COLORS.purple },
   weightsGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
   weightItem: { flex: 1, minWidth: '22%', alignItems: 'center' },
+  weightToggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginBottom: 4,
+  },
   weightLabel: {
     fontSize: 10,
     fontWeight: '700',
     color: COLORS.slateMuted,
-    marginBottom: 4,
     textTransform: 'uppercase',
+  },
+  weightMaxHint: {
+    fontSize: 9,
+    color: COLORS.gray,
+    marginTop: 2,
+    fontWeight: '600',
   },
   weightInput: {
     width: '100%',
@@ -1588,6 +2357,55 @@ const styles = StyleSheet.create({
     marginTop: 8,
     fontStyle: 'italic',
   },
+  weightsTotalRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 10,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: '#DDD6FE',
+  },
+  weightsTotalLabel: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: COLORS.purple,
+    textTransform: 'uppercase',
+  },
+  weightsTotalValue: { fontSize: 14, fontWeight: '800' },
+
+  // Skills section
+  skillsSectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  skillsSectionTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: COLORS.slate,
+    textTransform: 'uppercase',
+  },
+  fillScoresBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    backgroundColor: COLORS.primaryLight,
+    borderWidth: 1,
+    borderColor: COLORS.primary + '55',
+  },
+  fillScoresBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.primary,
+  },
+
+  // Question cards
   questionCard: {
     backgroundColor: COLORS.white,
     borderRadius: 12,
@@ -1679,6 +2497,8 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
   },
   questionTotalValue: { fontSize: 14, fontWeight: '800' },
+
+  // Grand total
   grandTotalCard: {
     backgroundColor: COLORS.primaryLight,
     borderRadius: 12,
@@ -1702,6 +2522,8 @@ const styles = StyleSheet.create({
   grandLabelBold: { fontSize: 13, fontWeight: '800', color: COLORS.slate },
   grandValue: { fontSize: 14, fontWeight: '800' },
   grandValuePrimary: { fontSize: 16, fontWeight: '800', color: COLORS.primary },
+
+  // Skill cards (Reading)
   skillCard: {
     backgroundColor: COLORS.white,
     borderRadius: 12,
@@ -1710,12 +2532,23 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.border,
   },
+  skillCardDisabled: {
+    backgroundColor: COLORS.background,
+    opacity: 0.7,
+  },
+  skillHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 8,
+  },
   skillLabel: {
     fontSize: 13,
     fontWeight: '800',
     color: COLORS.slate,
-    marginBottom: 8,
   },
+
+  // Footer
   footer: {
     flexDirection: 'row',
     gap: 10,
@@ -1746,3 +2579,5 @@ const styles = StyleSheet.create({
   },
   saveBtnText: { fontSize: 14, fontWeight: '700', color: '#fff' },
 });
+
+//   body: { flex: 1, paddingHorizontal: 16 },

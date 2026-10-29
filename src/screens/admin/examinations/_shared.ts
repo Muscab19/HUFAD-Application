@@ -192,6 +192,27 @@ export type ExamStatus = 'Pass' | 'Fail';
 export type ExamScope = 'surah' | 'juz';
 export type DateType = 'gregorian' | 'hijri' | 'both';
 
+/**
+ * Reading & Writing categories. Each skill is scored against every
+ * enabled category. Disabling a category zeroes out its weight and
+ * hides its column.
+ */
+export type ReadingCategory = 'readingScore' | 'writingScore' | 'hijaa' | 'ayahs';
+export const READING_CATEGORIES: ReadingCategory[] = [
+  'readingScore',
+  'writingScore',
+  'hijaa',
+  'ayahs',
+];
+
+/** Map category -> the suffix used in readingWritingScores keys. */
+export const CATEGORY_SUFFIX: Record<ReadingCategory, string> = {
+  readingScore: 'reading',
+  writingScore: 'writing',
+  hijaa: 'hijaa',
+  ayahs: 'ayahs',
+};
+
 export interface ExamColumn {
   id: string;
   key: string;
@@ -244,6 +265,17 @@ export interface ExamNotes {
   negative: string;
 }
 
+/**
+ * School branding used on printed exam sheets. Persisted per tenant
+ * (server) or locally (AsyncStorage) — see `brandingApi` below.
+ */
+export interface SchoolBranding {
+  logo?: string | null;         // base64 data URI
+  nameAr?: string;
+  nameEn?: string;
+  nameSo?: string;
+}
+
 export interface ExamSettings {
   passingMark: number;
   passingMarkReadingWriting: number;
@@ -253,6 +285,8 @@ export interface ExamSettings {
   notesTemplate: ExamNotes;
   readingWritingHeaders: ReadingWritingHeader[];
   readingWritingWeights: ReadingWritingWeights;
+  /** Optional — populated when the server supports branding. */
+  branding?: SchoolBranding;
 }
 
 export interface Exam {
@@ -281,6 +315,9 @@ export interface Exam {
   readingWritingHeaders?: ReadingWritingHeader[];
   readingWritingScores?: Record<string, number | string>;
   readingWritingWeights?: ReadingWritingWeights;
+  // NEW — per-exam skill/category toggles for Reading & Writing
+  enabledSkills?: Record<string, boolean>;
+  enabledCategories?: Partial<Record<ReadingCategory, boolean>>;
   totalMarks?: number;
   obtainedMarks?: number;
   percentage?: number;
@@ -373,8 +410,16 @@ export const DEFAULT_MARKS_PER: MarksPer = {
   tajwid: 0.8,
 };
 
+/** Default toggle state — everything enabled. */
+export const DEFAULT_ENABLED_CATEGORIES: Record<ReadingCategory, boolean> = {
+  readingScore: true,
+  writingScore: true,
+  hijaa: true,
+  ayahs: true,
+};
+
 // ============================================================
-// HELPERS
+// HELPERS — generic
 // ============================================================
 export const round2 = (v: any): number => {
   if (v === undefined || v === null || isNaN(Number(v))) return 0;
@@ -405,6 +450,148 @@ export const getExamFormType = (exam: Exam): ExamFormType => {
   return (exam.examFormType || exam.formType || 'memorization') as ExamFormType;
 };
 
+// ============================================================
+// HELPERS — Reading & Writing (skill/category enable + exact maths)
+// ============================================================
+
+/**
+ * Filters Reading/Writing headers to only "skill" rows (excludes
+ * total / estimation / category headers) that are enabled.
+ */
+export const getEnabledSkillHeaders = (
+  headers: ReadingWritingHeader[],
+  enabledSkills?: Record<string, boolean> | null
+): ReadingWritingHeader[] => {
+  return headers.filter(
+    (h) =>
+      h.id !== 'total' &&
+      h.id !== 'estimation' &&
+      h.id !== 'readingScore' &&
+      h.id !== 'writingScore' &&
+      h.id !== 'hijaa' &&
+      h.id !== 'ayahs' &&
+      (enabledSkills ? enabledSkills[h.id] !== false : true)
+  );
+};
+
+/** Returns the list of categories that are currently enabled. */
+export const getEnabledCategories = (
+  enabledCategories?: Partial<Record<ReadingCategory, boolean>> | null
+): ReadingCategory[] => {
+  return READING_CATEGORIES.filter(
+    (cat) => (enabledCategories ? enabledCategories[cat] !== false : true)
+  );
+};
+
+/** Effective weights — disabled categories are treated as 0. */
+export const getEffectiveWeights = (
+  weights: ReadingWritingWeights,
+  enabledCategories?: Partial<Record<ReadingCategory, boolean>> | null
+): ReadingWritingWeights => {
+  const out: ReadingWritingWeights = {
+    readingScore: 0,
+    writingScore: 0,
+    hijaa: 0,
+    ayahs: 0,
+  };
+  READING_CATEGORIES.forEach((cat) => {
+    const enabled = enabledCategories ? enabledCategories[cat] !== false : true;
+    out[cat] = enabled ? weights[cat] || 0 : 0;
+  });
+  return out;
+};
+
+/** Sum of enabled weights (i.e. max possible grand total). */
+export const getEffectiveMaxTotal = (
+  weights: ReadingWritingWeights,
+  enabledCategories?: Partial<Record<ReadingCategory, boolean>> | null
+): number => {
+  const eff = getEffectiveWeights(weights, enabledCategories);
+  return round2(eff.readingScore + eff.writingScore + eff.hijaa + eff.ayahs);
+};
+
+/**
+ * Distributes `total` across `count` items so that the sum is exactly
+ * `total` (avoids floating-point drift). The first item absorbs any
+ * remainder in cents.
+ */
+export const distributeExactly = (total: number, count: number): number[] => {
+  if (count <= 0) return [];
+  const totalCents = Math.round(round2(total) * 100);
+  const baseCents = Math.floor(totalCents / count);
+  const remainderCents = totalCents - baseCents * count;
+  const result = new Array(count).fill(baseCents / 100);
+  if (remainderCents > 0) {
+    result[0] = (baseCents + remainderCents) / 100;
+  }
+  return result;
+};
+
+/**
+ * Given the list of enabled skill headers and the effective weights,
+ * return per-category per-skill max score arrays. Index aligns with
+ * the enabled skill list.
+ */
+export const calculateExactSkillMaxes = (
+  enabledSkillsList: ReadingWritingHeader[],
+  weights: ReadingWritingWeights
+): {
+  reading: number[];
+  writing: number[];
+  hijaa: number[];
+  ayahs: number[];
+} => {
+  const n = enabledSkillsList.length;
+  if (n === 0) {
+    return { reading: [], writing: [], hijaa: [], ayahs: [] };
+  }
+  return {
+    reading: distributeExactly(weights.readingScore || 0, n),
+    writing: distributeExactly(weights.writingScore || 0, n),
+    hijaa: distributeExactly(weights.hijaa || 0, n),
+    ayahs: distributeExactly(weights.ayahs || 0, n),
+  };
+};
+
+/** Score key helper — `${skillId}_${suffix}`. */
+export const scoreKey = (
+  skillId: string,
+  category: ReadingCategory
+): string => `${skillId}_${CATEGORY_SUFFIX[category]}`;
+
+/** Sum of scores for one category across enabled skills. */
+export const calculateCategoryTotal = (
+  scores: Record<string, number | string> | undefined,
+  enabledSkillsList: ReadingWritingHeader[],
+  category: ReadingCategory
+): number => {
+  let total = 0;
+  enabledSkillsList.forEach((h) => {
+    const key = scoreKey(h.id, category);
+    const val = scores?.[key];
+    if (val !== undefined && val !== '' && val !== '-') {
+      total += typeof val === 'number' ? val : parseFloat(String(val)) || 0;
+    }
+  });
+  return round2(total);
+};
+
+/** Grand total across enabled categories + enabled skills. */
+export const calculateGrandTotal = (
+  scores: Record<string, number | string> | undefined,
+  enabledSkillsList: ReadingWritingHeader[],
+  enabledCategories: ReadingCategory[]
+): number => {
+  let total = 0;
+  enabledCategories.forEach((cat) => {
+    total += calculateCategoryTotal(scores, enabledSkillsList, cat);
+  });
+  return round2(total);
+};
+
+// ============================================================
+// HELPERS — Memorization (question breakdown)
+// ============================================================
 export const computeQuestionContribution = (
   q: ExamQuestion,
   columns: ExamColumn[],
@@ -464,41 +651,25 @@ export const getVisibleColumns = (settings?: ExamSettings | null): ExamColumn[] 
     .sort((a, b) => (a.order || 0) - (b.order || 0));
 };
 
+/** Deprecated but kept for backward-compat with existing screens. */
 export const computeReadingTotals = (
   headers: ReadingWritingHeader[],
   scores: Record<string, number | string>,
   weights: ReadingWritingWeights
 ) => {
-  const skillHeaders = headers.filter(
-    (h) =>
-      h.id !== 'total' &&
-      h.id !== 'estimation' &&
-      h.id !== 'readingScore' &&
-      h.id !== 'writingScore' &&
-      h.id !== 'hijaa' &&
-      h.id !== 'ayahs'
-  );
-
-  let readingTotal = 0;
-  let writingTotal = 0;
-  let hijaaTotal = 0;
-  let ayahsTotal = 0;
-
-  skillHeaders.forEach((h) => {
-    readingTotal += parseFloat(String(scores[`${h.id}_reading`] ?? 0)) || 0;
-    writingTotal += parseFloat(String(scores[`${h.id}_writing`] ?? 0)) || 0;
-    hijaaTotal += parseFloat(String(scores[`${h.id}_hijaa`] ?? 0)) || 0;
-    ayahsTotal += parseFloat(String(scores[`${h.id}_ayahs`] ?? 0)) || 0;
-  });
-
-  const grandTotal = readingTotal + writingTotal + hijaaTotal + ayahsTotal;
-  const maxTotal =
+  const skillHeaders = getEnabledSkillHeaders(headers, null);
+  const readingTotal = calculateCategoryTotal(scores, skillHeaders, 'readingScore');
+  const writingTotal = calculateCategoryTotal(scores, skillHeaders, 'writingScore');
+  const hijaaTotal = calculateCategoryTotal(scores, skillHeaders, 'hijaa');
+  const ayahsTotal = calculateCategoryTotal(scores, skillHeaders, 'ayahs');
+  const grandTotal = round2(readingTotal + writingTotal + hijaaTotal + ayahsTotal);
+  const maxTotal = round2(
     (weights.readingScore || 0) +
-    (weights.writingScore || 0) +
-    (weights.hijaa || 0) +
-    (weights.ayahs || 0);
+      (weights.writingScore || 0) +
+      (weights.hijaa || 0) +
+      (weights.ayahs || 0)
+  );
   const percentage = maxTotal > 0 ? (grandTotal / maxTotal) * 100 : 0;
-
   return {
     readingTotal,
     writingTotal,
@@ -506,7 +677,7 @@ export const computeReadingTotals = (
     ayahsTotal,
     grandTotal,
     maxTotal,
-    percentage,
+    percentage: round2(percentage),
   };
 };
 
@@ -534,6 +705,7 @@ export const api = {
             ? res.readingWritingHeaders
             : DEFAULT_READING_HEADERS,
         readingWritingWeights: res.readingWritingWeights || DEFAULT_READING_WEIGHTS,
+        branding: res.branding || undefined,
       };
       return settings;
     } catch (err) {
@@ -622,3 +794,28 @@ export const api = {
     return await apiClient.post('/exams/bulk-unpublish', { examIds });
   },
 };
+
+// ============================================================
+// BRANDING — server-first, local fallback
+// ============================================================
+// On mobile we don't have localStorage, so branding is persisted
+// through the exam-settings endpoint (server-side). The API
+// `saveSettings` accepts `branding` inside the settings object, so
+// callers can just pass `{ branding }`.
+export const brandingApi = {
+  getFromSettings: (settings: ExamSettings | null): SchoolBranding => {
+    return settings?.branding || { logo: null, nameAr: '', nameEn: '', nameSo: '' };
+  },
+  saveViaSettings: async (
+    branding: SchoolBranding
+  ): Promise<any> => {
+    return await api.saveSettings({ branding } as any);
+  },
+};
+
+// ============================================================
+// MISCELLANEOUS — kept for compatibility
+// ============================================================
+export const noop = () => {};
+export const capitalize = (s?: string) =>
+  s ? s.charAt(0).toUpperCase() + s.slice(1) : '';

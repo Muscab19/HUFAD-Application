@@ -91,11 +91,20 @@ class ApiClient {
           log('  error body:', JSON.stringify(error.response.data).slice(0, 500));
         }
 
-        // Only clear auth for 401 on non-auth routes (don't nuke session on bad login)
+        // Only handle 401 for non-auth routes (don't nuke session on bad login)
         const url = error.config?.url || '';
         const isAuthRoute = url.includes('/auth/');
         if (error.response?.status === 401 && !isAuthRoute) {
           await storage.clearAuth();
+          // Trigger the global auth-context logout
+          try {
+            // Lazy import to avoid circular deps
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { triggerGlobalForceLogout } = require('../context/AuthContext');
+            await triggerGlobalForceLogout();
+          } catch (e) {
+            console.warn('forceLogout after 401 failed', e);
+          }
         }
 
         const apiError: ApiError = {

@@ -64,12 +64,65 @@ const initialsOf = (first?: string, last?: string, username?: string) => {
   return 'U';
 };
 
-const displayRole = (role?: string) => {
+// ============================================================
+// ROLE HELPERS — normalize any role shape into a safe string
+// ============================================================
+const ADMIN_ROLES = [
+  'admin',
+  'super_admin',
+  'superadmin',
+  'school_admin',
+  'schooladmin',
+  'owner',
+  'principal',
+  'manager',
+];
+
+/** Turn any role value (string, object, array) into a lowercase slug. */
+const normalizeRole = (role: any): string => {
   if (!role) return '';
-  return role.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+
+  // Array of roles → use the first one (or the highest-priority one)
+  if (Array.isArray(role)) {
+    const flat = role
+      .map((r) => normalizeRole(r))
+      .filter(Boolean);
+    if (flat.length === 0) return '';
+    // Prefer admin-ish roles if any present
+    const admin = flat.find((r) => ADMIN_ROLES.includes(r));
+    return admin || flat[0];
+  }
+
+  // Object with a `name`, `slug`, `code`, `key`, or `role` field
+  if (typeof role === 'object') {
+    return (
+      normalizeRole(role.name) ||
+      normalizeRole(role.slug) ||
+      normalizeRole(role.code) ||
+      normalizeRole(role.key) ||
+      normalizeRole(role.role) ||
+      normalizeRole(role.value) ||
+      ''
+    );
+  }
+
+  // Primitive (string / number)
+  return String(role).trim().toLowerCase().replace(/\s+/g, '_');
 };
 
-const ADMIN_ROLES = ['admin', 'super_admin', 'school_admin'];
+/** Human-readable label for any role shape. */
+const displayRole = (role: any): string => {
+  const s = normalizeRole(role);
+  if (!s) return '';
+  return s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+};
+
+/** True if the role matches one of the admin-ish buckets. */
+const isAdminRole = (role: any): boolean => {
+  const s = normalizeRole(role);
+  if (!s) return false;
+  return ADMIN_ROLES.includes(s);
+};
 
 // ============================================================
 // SCREEN
@@ -106,7 +159,8 @@ export const ProfileScreen: React.FC = () => {
   // ============================================================
   // RBAC — Only admin / school_admin see branch switcher
   // ============================================================
-  const isAdmin = !!user && ADMIN_ROLES.includes(user.role as string);
+  const roleSlug = useMemo(() => normalizeRole((user as any)?.role), [user]);
+  const isAdmin = isAdminRole((user as any)?.role);
   const hasAssignedBranch = !!(user as any)?.branchId;
 
   const canSwitchBranches = isAdmin && !hasAssignedBranch;
@@ -360,9 +414,15 @@ export const ProfileScreen: React.FC = () => {
           </TouchableOpacity>
 
           <Text style={styles.userName}>{fullName}</Text>
-          <View style={styles.rolePill}>
-            <Text style={styles.rolePillText}>{displayRole(user.role)}</Text>
-          </View>
+          {(() => {
+            const label = displayRole((user as any)?.role);
+            if (!label) return null;
+            return (
+              <View style={styles.rolePill}>
+                <Text style={styles.rolePillText}>{label}</Text>
+              </View>
+            );
+          })()}
           {!!user.email && <Text style={styles.userEmail}>{user.email}</Text>}
         </View>
 
@@ -1218,3 +1278,5 @@ const styles = StyleSheet.create({
 });
 
 export default ProfileScreen;
+
+// onPress: async () => {

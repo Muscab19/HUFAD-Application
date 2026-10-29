@@ -1,5 +1,11 @@
 // src/screens/admin/FinancialManagementScreen.tsx
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   View,
   Text,
@@ -14,15 +20,31 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
+  Image,
+  Keyboard,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Print from 'expo-print';
+import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useTranslation } from 'react-i18next';
 import { api as apiClient } from '../../api/client';
 import { useBranch } from '../../context/BranchContext';
+import { useAuth } from '../../context/AuthContext';
+
+// Optional image picker
+let ImagePicker: any = null;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  ImagePicker = require('expo-image-picker');
+} catch {
+  ImagePicker = null;
+}
 
 // ============================================================
-// BRAND COLORS
+// COLORS
 // ============================================================
 const COLORS = {
   primary: '#0A8E5A',
@@ -93,6 +115,7 @@ interface StudentRef {
   parent?: string;
   fee?: number;
   monthlyFee?: number;
+  halaqah?: { name?: string } | string;
 }
 
 interface EmployeeRef {
@@ -141,6 +164,8 @@ interface Payroll {
   baseSalary: number;
   amountPaid?: number;
   netPay?: number;
+  bonuses?: number;
+  deductions?: number;
   paymentMethod?: string;
   reference?: string;
   notes?: string;
@@ -176,8 +201,19 @@ interface ParentHistory {
   }[];
 }
 
+interface InvoiceSettings {
+  logo: string | null;
+  schoolName: string;
+  phone: string;
+  email: string;
+  address: string;
+  footer: string;
+}
+
+type PrintType = 'payment' | 'history' | 'payroll';
+
 // ============================================================
-// CONSTANTS + TRANSLATION KEY MAPS
+// CONSTANTS
 // ============================================================
 const EXPENSE_CATEGORY_KEY: Record<string, string> = {
   Rent: 'rent',
@@ -197,7 +233,11 @@ const PAYMENT_METHOD_KEY: Record<PaymentMethod, string> = {
   'Bank Transfer': 'bankTransfer',
   Cash: 'cash',
 };
-const PAYMENT_METHODS: PaymentMethod[] = ['Mobile Money', 'Bank Transfer', 'Cash'];
+const PAYMENT_METHODS: PaymentMethod[] = [
+  'Mobile Money',
+  'Bank Transfer',
+  'Cash',
+];
 
 const STATUS_KEY: Record<PaymentStatus, string> = {
   paid: 'paid',
@@ -211,18 +251,50 @@ const PAYROLL_STATUS_KEY: Record<PayrollStatus, string> = {
   Cancelled: 'cancelled',
 };
 
+const DEFAULT_INVOICE_SETTINGS: InvoiceSettings = {
+  logo: null,
+  schoolName: 'Al-Irshaad Institute',
+  phone: '+252 61X XXX XXX',
+  email: 'info@alirshaad.edu.so',
+  address: 'Mogadishu, Somalia',
+  footer: 'Thank you for your payment',
+};
+
+// ============================================================
+// INCOME CATEGORIES
+// ============================================================
+interface IncomeCategory {
+  id: string;
+  name: string;
+  parentIds: string[];
+  color?: string;
+  createdAt: string;
+}
+
+const CATEGORY_COLOR_PALETTE = [
+  '#0A8E5A',
+  '#2878D0',
+  '#7C3AED',
+  '#DB2777',
+  '#D97706',
+  '#0D9488',
+  '#DC2626',
+  '#C9A227',
+];
+
+const incomeCategoriesKey = (tenantId: string, branchId: string) =>
+  `finance_income_categories_${tenantId || 'global'}_${branchId || 'global'}`;
+
 // ============================================================
 // HELPERS
 // ============================================================
-const unwrap = (res: any): any => {
-  if (res && typeof res === 'object' && 'data' in res) return res.data;
-  return res;
-};
-
 const unwrapData = (res: any): any => {
-  const u = unwrap(res);
-  if (u && typeof u === 'object' && 'data' in u) return u.data;
-  return u;
+  if (res && typeof res === 'object' && 'data' in res) {
+    const u = res.data;
+    if (u && typeof u === 'object' && 'data' in u) return u.data;
+    return u;
+  }
+  return res;
 };
 
 const asArray = <T,>(v: any): T[] => (Array.isArray(v) ? v : []);
@@ -274,9 +346,565 @@ const statusStyle = (status: PaymentStatus) => {
 
 const isBranchError = (err: any) => {
   const msg = err?.response?.data?.message || err?.message || '';
-  return (
-    typeof msg === 'string' && msg.toLowerCase().includes('branch id is required')
-  );
+  return typeof msg === 'string' && msg.toLowerCase().includes('branch id is required');
+};
+
+const esc = (v: any): string =>
+  String(v ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const invoiceSettingsKey = (tenantId: string, branchId: string) =>
+  `finance_invoice_settings_${tenantId || 'global'}_${branchId || 'global'}`;
+
+const ensureShareablePdf = async (sourceUri: string): Promise<string> => {
+  const stamp = Date.now();
+  const fileName = `finance-${stamp}.pdf`;
+  const FS: any = FileSystem as any;
+
+  if (FS.Paths && FS.File) {
+    const dir = FS.Paths.document;
+    const dest = `${dir.uri.replace(/\/$/, '')}/${fileName}`;
+    const src = new FS.File(sourceUri);
+    const target = new FS.File(dest);
+    if (src.exists) {
+      if (target.exists) {
+        try {
+          target.delete();
+        } catch {}
+      }
+      src.copy(target);
+      return dest;
+    }
+    return sourceUri;
+  }
+
+  const dir: string = FS.documentDirectory || FS.cacheDirectory || '';
+  if (!dir) return sourceUri;
+  const dest = `${dir.replace(/\/$/, '')}/${fileName}`;
+  try {
+    await FS.copyAsync({ from: sourceUri, to: dest });
+    return dest;
+  } catch (e) {
+    console.warn('copyAsync failed', e);
+    return sourceUri;
+  }
+};
+
+// ============================================================
+// PRINT HTML BUILDER
+// ============================================================
+interface BuildPrintInput {
+  type: PrintType;
+  data: any;
+  design: InvoiceSettings;
+}
+
+const buildPrintHtml = ({ type, data, design }: BuildPrintInput): string => {
+  const isLedger = type === 'history';
+  const isPayroll = type === 'payroll';
+  const isPayment = type === 'payment';
+
+  const documentTitle = isPayment
+    ? 'Payment Receipt'
+    : isLedger
+    ? 'Student Ledger'
+    : 'Payroll Invoice';
+
+  const pageSize = isLedger ? 'A4 portrait' : 'A5 portrait';
+  const maxContainerWidth = isLedger ? '800px' : '520px';
+  const basePadding = isLedger ? '24px' : '14px';
+  const fontSize = isLedger ? '12px' : '11px';
+
+  let body = '';
+
+  // ---- PAYMENT RECEIPT ----
+  if (isPayment) {
+    body = `
+      <table class="data-table">
+        <thead>
+          <tr><th colspan="3" class="section-banner">Student Details</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="width:33%;">
+              <div class="field-label">Student ID</div>
+              <div class="field-value">${esc(data.studentId || data._id?.slice(-8) || 'N/A')}</div>
+            </td>
+            <td style="width:34%;">
+              <div class="field-label">Student Name</div>
+              <div class="field-value">${esc(data.studentName || 'N/A')}</div>
+            </td>
+            <td style="width:33%;">
+              <div class="field-label">Parent Name</div>
+              <div class="field-value">${esc(data.parentName || data.parentId || 'N/A')}</div>
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <div class="field-label">Halaqah</div>
+              <div class="field-value">${esc(data.halaqah || 'N/A')}</div>
+            </td>
+            <td colspan="2">
+              <div class="field-label">Billing Month</div>
+              <div class="field-value">${esc(
+                data.month ? fullMonthName(data.month) : 'N/A'
+              )} ${esc(data.year || '')}</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <table class="data-table">
+        <thead>
+          <tr><th colspan="3" class="section-banner">Transaction Metadata</th></tr>
+          <tr>
+            <th class="table-sub-label" style="width:40%;">Payment Method</th>
+            <th class="table-sub-label" style="width:30%;">Payment Date</th>
+            <th class="table-sub-label" style="width:30%;">Reference No.</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="field-value">${esc(data.paymentMethod || 'Cash')}</span></td>
+            <td><span class="field-value">${esc(
+              data.paymentDate
+                ? new Date(data.paymentDate).toLocaleDateString('en-US', {
+                    year: 'numeric',
+                    month: 'long',
+                    day: '2-digit',
+                  })
+                : 'N/A'
+            )}</span></td>
+            <td><span class="field-value">${esc(data.reference || 'N/A')}</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <table class="data-table">
+        <thead>
+          <tr><th colspan="3" class="section-banner">Receipt Detail</th></tr>
+          <tr>
+            <th class="table-sub-label" style="width:45%;">Account Item</th>
+            <th class="table-sub-label" style="width:20%;">Amount</th>
+            <th class="table-sub-label" style="width:35%;">Description</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="field-value">Tuition Fee</td>
+            <td class="field-value amount-column">${fmtMoney(data.amount)}</td>
+            <td style="color:#475569;">${esc(data.notes || 'Monthly Tuition Fee Collection')}</td>
+          </tr>
+          <tr class="total-row">
+            <td>Total Amount Paid:</td>
+            <td class="amount-column">${fmtMoney(data.amount)}</td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+  }
+
+  // ---- LEDGER ----
+  if (isLedger) {
+    const summary = data.summary || {};
+    const monthlyHistory = asArray<any>(data.monthlyHistory);
+    const payments = asArray<any>(data.payments);
+
+    body = `
+      <table class="data-table">
+        <thead>
+          <tr><th colspan="2" class="section-banner">Account Ledger Profile</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="width:50%;">
+              <div class="field-label">Sponsor / Parent Name</div>
+              <div class="field-value">${esc(data.name || 'N/A')}</div>
+            </td>
+            <td style="width:50%;">
+              <div class="field-label">Contact Primary Phone</div>
+              <div class="field-value">${esc(data.phone || 'N/A')}</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <table class="data-table" style="text-align:center;">
+        <thead>
+          <tr>
+            <th class="table-sub-label" style="text-align:center;">Total Paid</th>
+            <th class="table-sub-label" style="text-align:center;">Total Dues</th>
+            <th class="table-sub-label" style="text-align:center;">Remaining Balance</th>
+            <th class="table-sub-label" style="text-align:center;">Registered Children</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="field-value status-paid" style="font-size:14px;text-align:center;">${fmtMoney(
+              summary.totalPaid
+            )}</td>
+            <td class="field-value" style="font-size:14px;text-align:center;color:#2563eb;">${fmtMoney(
+              summary.totalDues
+            )}</td>
+            <td class="field-value ${
+              (summary.totalBalance || 0) > 0 ? 'status-partial' : 'status-paid'
+            }" style="font-size:14px;text-align:center;">${fmtMoney(
+      summary.totalBalance
+    )}</td>
+            <td class="field-value" style="font-size:14px;text-align:center;color:#7c3aed;">${esc(
+              summary.totalChildren || 0
+            )}</td>
+          </tr>
+        </tbody>
+      </table>
+    `;
+
+    if (monthlyHistory.length > 0) {
+      const sorted = [...monthlyHistory].sort((a, b) => {
+        if (a.year !== b.year) return b.year - a.year;
+        return b.month - a.month;
+      });
+      body += `
+        <table class="data-table">
+          <thead>
+            <tr><th colspan="5" class="section-banner">Invoiced Monthly History</th></tr>
+            <tr>
+              <th class="table-sub-label">Statement Period</th>
+              <th class="table-sub-label amount-column">Amount Due</th>
+              <th class="table-sub-label amount-column">Amount Paid</th>
+              <th class="table-sub-label amount-column">Balance</th>
+              <th class="table-sub-label status-column">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${sorted
+              .map((m) => {
+                const sc =
+                  m.status?.toLowerCase() === 'paid'
+                    ? 'status-paid'
+                    : m.status?.toLowerCase() === 'partial'
+                    ? 'status-partial'
+                    : 'status-unpaid';
+                return `
+              <tr class="payment-row">
+                <td class="field-value">${monthName(m.month)} ${esc(m.year)}</td>
+                <td class="amount-column">${fmtMoney(m.totalDue)}</td>
+                <td class="amount-column">${fmtMoney(m.totalPaid)}</td>
+                <td class="amount-column">${fmtMoney(m.balance)}</td>
+                <td class="status-column ${sc}">${esc(m.status || 'Unpaid')}</td>
+              </tr>`;
+              })
+              .join('')}
+          </tbody>
+        </table>
+      `;
+    }
+
+    if (payments.length > 0) {
+      body += `
+        <table class="data-table">
+          <thead>
+            <tr><th colspan="4" class="section-banner">Recent Transaction History</th></tr>
+            <tr>
+              <th class="table-sub-label">Date</th>
+              <th class="table-sub-label">Associated Student</th>
+              <th class="table-sub-label amount-column">Collected Amount</th>
+              <th class="table-sub-label">Payment Method</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${payments
+              .slice(0, 20)
+              .map(
+                (p) => `
+              <tr>
+                <td>${esc(
+                  p.paymentDate
+                    ? new Date(p.paymentDate).toLocaleDateString()
+                    : 'N/A'
+                )}</td>
+                <td class="field-value">${esc(p.studentName || 'N/A')}</td>
+                <td class="field-value amount-column">${fmtMoney(p.amount)}</td>
+                <td>${esc(p.paymentMethod || 'Cash')}</td>
+              </tr>`
+              )
+              .join('')}
+          </tbody>
+        </table>
+      `;
+    }
+  }
+
+  // ---- PAYROLL ----
+  if (isPayroll) {
+    body = `
+      <table class="data-table">
+        <thead>
+          <tr><th colspan="3" class="section-banner">Employee Assignment Details</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="width:35%;">
+              <div class="field-label">Employee Name</div>
+              <div class="field-value">${esc(data.employeeName || 'N/A')}</div>
+            </td>
+            <td style="width:35%;">
+              <div class="field-label">Assigned Role</div>
+              <div class="field-value">${esc(data.role || 'N/A')}</div>
+            </td>
+            <td style="width:30%;">
+              <div class="field-label">Payroll Statement Period</div>
+              <div class="field-value">${esc(
+                data.month ? fullMonthName(data.month) : 'N/A'
+              )} ${esc(data.year || '')}</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <table class="data-table">
+        <thead>
+          <tr><th colspan="3" class="section-banner">Financial Remuneration Breakdown</th></tr>
+          <tr>
+            <th class="table-sub-label" style="width:45%;">Earning Description Type</th>
+            <th class="table-sub-label amount-column" style="width:25%;">Amount</th>
+            <th class="table-sub-label" style="width:30%;">Status Context</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="field-value">Base Contract Salary</td>
+            <td class="field-value amount-column">${fmtMoney(data.baseSalary)}</td>
+            <td style="color:#475569;">Standard Base Tier</td>
+          </tr>
+          ${
+            (data.bonuses || 0) > 0
+              ? `<tr>
+                  <td class="field-value status-paid">Performance Bonuses Added</td>
+                  <td class="field-value amount-column status-paid">+${fmtMoney(data.bonuses)}</td>
+                  <td class="status-paid">Approved Bonus Incentives</td>
+                </tr>`
+              : ''
+          }
+          ${
+            (data.deductions || 0) > 0
+              ? `<tr>
+                  <td class="field-value status-unpaid">Statutory Deductions Subtracted</td>
+                  <td class="field-value amount-column status-unpaid">-${fmtMoney(data.deductions)}</td>
+                  <td class="status-unpaid">Absences/Penalties Deductions</td>
+                </tr>`
+              : ''
+          }
+          <tr class="total-row">
+            <td>Net Total Payable Amount Paid:</td>
+            <td class="amount-column" style="color:#6b21a8;">${fmtMoney(
+              data.netPay ?? data.amountPaid
+            )}</td>
+            <td style="color:${
+              data.status === 'Paid' ? '#16a34a' : '#ea580c'
+            };font-weight:bold;">${esc(data.status || 'Paid')}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      ${
+        data.notes
+          ? `<table class="data-table">
+              <tbody>
+                <tr>
+                  <td>
+                    <div class="field-label">Administrative Notes / Context Comments</div>
+                    <div style="font-size:11px;color:#334155;">${esc(data.notes)}</div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>`
+          : ''
+      }
+    `;
+  }
+
+  // ---- HEADER ----
+  const headerHtml = `
+    <div class="header-wrapper">
+      ${
+        design.logo
+          ? `<img src="${design.logo}" class="logo-img" alt="Logo" />`
+          : '<div style="font-size:10px;color:#64748b;margin-bottom:10px;border:1px solid #cbd5e1;padding:8px 16px;">[ LOGO PLACEHOLDER ]</div>'
+      }
+      <h1 class="school-name">${esc(design.schoolName || 'Al-Irshaad Institute')}</h1>
+      <div class="school-contact">
+        <span>📞 ${esc(design.phone || '+252 61X XXX XXX')}</span>
+        <span class="contact-separator">|</span>
+        <span>✉️ ${esc(design.email || 'info@alirshaad.edu.so')}</span>
+        <span class="contact-separator">|</span>
+        <span>📍 ${esc(design.address || 'Mogadishu, Somalia')}</span>
+      </div>
+    </div>
+    <div class="gray-header-bar">${esc(documentTitle)}</div>
+  `;
+
+  // ---- FOOTER ----
+  const footerHtml = `
+    <table style="width:100%;border-collapse:collapse;margin-top:10px;">
+      <tr>
+        <td class="footer-meta-text" style="width:45%;text-align:left;padding:2px;vertical-align:top;">
+          <strong style="color:#0f172a;">NB:</strong> ${esc(
+            design.footer || 'Once transaction is processed, fees are strictly non-refundable.'
+          )}
+        </td>
+        <td class="footer-meta-text" style="width:30%;text-align:left;padding:2px;vertical-align:top;">
+          <strong>System Gen Date:</strong> ${esc(
+            new Date().toLocaleDateString('en-US', {
+              year: 'numeric',
+              month: 'long',
+              day: '2-digit',
+            })
+          )}
+        </td>
+        <td class="footer-meta-text" style="width:25%;text-align:right;padding:2px;vertical-align:top;">
+          <strong>Auth Signature:</strong>
+          <span style="font-family:cursive;text-decoration:underline;">&nbsp;&nbsp;${esc(
+            data.signature || 'Cashier Desk'
+          )}&nbsp;&nbsp;</span>
+        </td>
+      </tr>
+    </table>
+  `;
+
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>${esc(documentTitle)}</title>
+      <style>
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+          margin: 0; padding: 0;
+          color: #0f172a;
+          background: #ffffff;
+          -webkit-print-color-adjust: exact;
+          print-color-adjust: exact;
+          font-size: ${fontSize};
+        }
+        .print-container {
+          max-width: ${maxContainerWidth};
+          margin: 0 auto;
+          background: white;
+          padding: ${basePadding};
+          box-sizing: border-box;
+        }
+        .outer-frame {
+          border: 1px solid #475569;
+          padding: ${isLedger ? '20px' : '14px'};
+          position: relative;
+        }
+        .header-wrapper { text-align: center; margin-bottom: 16px; display: flex; flex-direction: column; align-items: center; }
+        .header-wrapper .logo-img { max-height: ${isLedger ? '150px' : '105px'}; width: auto; object-fit: contain; margin-bottom: 8px; }
+        .header-wrapper .school-name { font-size: ${isLedger ? '25px' : '22px'}; font-weight: 800; color: #0f172a; text-transform: uppercase; letter-spacing: 1.5px; margin: 0 0 6px 0; }
+        .header-wrapper .school-contact { font-size: ${isLedger ? '11px' : '10px'}; color: #475569; font-weight: 500; margin: 0; display: flex; justify-content: center; align-items: center; flex-wrap: wrap; }
+        .contact-separator { margin: 0 8px; color: #cbd5e1; }
+        .gray-header-bar {
+          background-color: #475569 !important;
+          color: #ffffff !important;
+          text-align: center;
+          font-weight: 600;
+          font-size: ${isLedger ? '13px' : '12px'};
+          padding: 5px;
+          text-transform: uppercase;
+          letter-spacing: 1px;
+          margin-bottom: 12px;
+          border: 1px solid #334155;
+        }
+        table.data-table { width: 100%; border-collapse: collapse; margin-bottom: 12px; font-size: ${isLedger ? '11.5px' : '10.5px'}; }
+        table.data-table th, table.data-table td { padding: ${isLedger ? '6px 8px' : '4px 6px'}; border: 1px solid #64748b; text-align: left; vertical-align: middle; }
+        table.data-table th.section-banner {
+          background-color: #cbd5e1 !important;
+          font-weight: 600;
+          color: #0f172a;
+          border-bottom: 1px solid #475569;
+          text-transform: uppercase;
+          font-size: ${isLedger ? '11px' : '10px'};
+          letter-spacing: 0.5px;
+          padding: 4px 6px;
+        }
+        table.data-table th.table-sub-label {
+          background-color: #f1f5f9 !important;
+          font-weight: 600;
+          color: #334155;
+          font-size: ${isLedger ? '11px' : '10px'};
+        }
+        .field-label { color: #475569; font-size: 9px; font-weight: 600; text-transform: uppercase; margin-bottom: 1px; }
+        .field-value { font-weight: 500; color: #0f172a; }
+        .total-row td { font-weight: 700; background-color: #f1f5f9 !important; border-top: 2px solid #475569; color: #0f172a; }
+        .amount-column { text-align: right !important; }
+        .status-column { text-align: center !important; }
+        .status-paid { color: #16a34a !important; font-weight: bold; }
+        .status-unpaid { color: #dc2626 !important; font-weight: bold; }
+        .status-partial { color: #ea580c !important; font-weight: bold; }
+        .footer-meta-text { font-size: 10px; font-weight: 500; color: #334155; }
+        @media print {
+          body { background: white; margin: 0; }
+          .print-container { padding: 0; max-width: 100%; }
+          .outer-frame { border: 1px solid #475569; box-shadow: none; }
+          .payment-row { page-break-inside: avoid; }
+        }
+        @page { size: ${pageSize}; margin: 8mm 10mm; }
+      </style>
+    </head>
+    <body>
+      <div class="print-container">
+        <div class="outer-frame">
+          ${headerHtml}
+          ${body}
+          ${footerHtml}
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+};
+
+const printFinanceSheet = async (
+  type: PrintType,
+  data: any,
+  design: InvoiceSettings
+) => {
+  try {
+    const html = buildPrintHtml({ type, data, design });
+    const { uri } = await Print.printToFileAsync({ html });
+    await Print.printAsync({ uri });
+  } catch (e) {
+    console.warn('printFinanceSheet failed', e);
+  }
+};
+
+const shareFinanceSheetAsPdf = async (
+  type: PrintType,
+  data: any,
+  design: InvoiceSettings
+) => {
+  try {
+    const html = buildPrintHtml({ type, data, design });
+    const { uri } = await Print.printToFileAsync({ html });
+    const shareableUri = await ensureShareablePdf(uri);
+    const canShare = await Sharing.isAvailableAsync();
+    if (canShare) {
+      await Sharing.shareAsync(shareableUri, {
+        mimeType: 'application/pdf',
+        dialogTitle: 'Share',
+        UTI: 'com.adobe.pdf',
+      });
+    }
+  } catch (e) {
+    console.warn('shareFinanceSheetAsPdf failed', e);
+  }
 };
 
 // ============================================================
@@ -285,8 +913,11 @@ const isBranchError = (err: any) => {
 export const FinancialManagementScreen: React.FC = () => {
   const { t } = useTranslation();
   const { currentBranch } = useBranch();
+  const { user } = useAuth();
   const branchId =
     (currentBranch as any)?._id || (currentBranch as any)?.id || '';
+  const tenantId =
+    (user as any)?.tenantId || (currentBranch as any)?.tenantId || '';
 
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [refreshing, setRefreshing] = useState(false);
@@ -305,13 +936,17 @@ export const FinancialManagementScreen: React.FC = () => {
   const [filterMonth, setFilterMonth] = useState(now.getMonth() + 1);
   const [filterYear, setFilterYear] = useState(now.getFullYear());
   const [monthlyStatus, setMonthlyStatus] = useState<MonthlyStatusRow[]>([]);
-  const [monthlySummary, setMonthlySummary] = useState<MonthlySummary | null>(null);
+  const [monthlySummary, setMonthlySummary] = useState<MonthlySummary | null>(
+    null
+  );
   const [hasDuesForMonth, setHasDuesForMonth] = useState(false);
   const [generatedMonths, setGeneratedMonths] = useState<
     { month: number; year: number }[]
   >([]);
   const [searchTerm, setSearchTerm] = useState('');
-  const [filterStatus, setFilterStatus] = useState<'All' | PaymentStatus>('All');
+  const [filterStatus, setFilterStatus] = useState<'All' | PaymentStatus>(
+    'All'
+  );
 
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [filterCategory, setFilterCategory] = useState('All');
@@ -325,12 +960,42 @@ export const FinancialManagementScreen: React.FC = () => {
   const [showGenerateModal, setShowGenerateModal] = useState(false);
   const [showCancelModal, setShowCancelModal] = useState(false);
   const [showReportModal, setShowReportModal] = useState(false);
+  const [showInvoiceModal, setShowInvoiceModal] = useState(false);
+  const [showPrintModal, setShowPrintModal] = useState(false);
 
   const [selectedParent, setSelectedParent] = useState<ParentRef | null>(null);
-  const [parentHistory, setParentHistory] = useState<ParentHistory | null>(null);
+  const [parentHistory, setParentHistory] = useState<ParentHistory | null>(
+    null
+  );
 
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
   const [editingPayroll, setEditingPayroll] = useState<Payroll | null>(null);
+
+  const [printData, setPrintData] = useState<any>(null);
+  const [printType, setPrintType] = useState<PrintType>('payment');
+
+  const [invoiceSettings, setInvoiceSettings] = useState<InvoiceSettings>({
+    ...DEFAULT_INVOICE_SETTINGS,
+  });
+  const [invoicePreview, setInvoicePreview] = useState<string>('');
+
+  // Income categories
+  const [incomeCategories, setIncomeCategories] = useState<IncomeCategory[]>([]);
+  const [showCategoriesModal, setShowCategoriesModal] = useState(false);
+  const [editingCategory, setEditingCategory] = useState<IncomeCategory | null>(
+    null
+  );
+  const [categoryForm, setCategoryForm] = useState<{
+    name: string;
+    parentIds: string[];
+    color: string;
+    parentSearch: string;
+  }>({
+    name: '',
+    parentIds: [],
+    color: CATEGORY_COLOR_PALETTE[0],
+    parentSearch: '',
+  });
 
   const [paymentForm, setPaymentForm] = useState<{
     parentSearch: string;
@@ -413,16 +1078,181 @@ export const FinancialManagementScreen: React.FC = () => {
   };
 
   // ============================================================
+  // INVOICE SETTINGS LOAD/SAVE
+  // ============================================================
+  useEffect(() => {
+    (async () => {
+      try {
+        const key = invoiceSettingsKey(tenantId, branchId);
+        const raw = await AsyncStorage.getItem(key);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          setInvoiceSettings({ ...DEFAULT_INVOICE_SETTINGS, ...parsed });
+          if (parsed.logo) setInvoicePreview(parsed.logo);
+        } else {
+          setInvoiceSettings({ ...DEFAULT_INVOICE_SETTINGS });
+          setInvoicePreview('');
+        }
+      } catch (e) {
+        console.warn('Load invoice settings failed', e);
+      }
+    })();
+
+    (async () => {
+      try {
+        const key = incomeCategoriesKey(tenantId, branchId);
+        const raw = await AsyncStorage.getItem(key);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) setIncomeCategories(parsed);
+        } else {
+          setIncomeCategories([]);
+        }
+      } catch (e) {
+        console.warn('Load income categories failed', e);
+        setIncomeCategories([]);
+      }
+    })();
+  }, [tenantId, branchId]);
+
+  const persistInvoiceSettings = async (next: InvoiceSettings) => {
+    try {
+      const key = invoiceSettingsKey(tenantId, branchId);
+      await AsyncStorage.setItem(key, JSON.stringify(next));
+    } catch (e) {
+      console.warn('Persist invoice settings failed', e);
+    }
+  };
+
+  const persistIncomeCategories = async (next: IncomeCategory[]) => {
+    try {
+      const key = incomeCategoriesKey(tenantId, branchId);
+      await AsyncStorage.setItem(key, JSON.stringify(next));
+    } catch (e) {
+      console.warn('Persist income categories failed', e);
+    }
+  };
+
+  // ============================================================
+  // INCOME CATEGORY HANDLERS
+  // ============================================================
+  const resetCategoryForm = () => {
+    setCategoryForm({
+      name: '',
+      parentIds: [],
+      color: CATEGORY_COLOR_PALETTE[0],
+      parentSearch: '',
+    });
+    setEditingCategory(null);
+  };
+
+  const openNewCategory = () => {
+    resetCategoryForm();
+    setShowCategoriesModal(true);
+  };
+
+  const openEditCategory = (cat: IncomeCategory) => {
+    setEditingCategory(cat);
+    setCategoryForm({
+      name: cat.name,
+      parentIds: [...cat.parentIds],
+      color: cat.color || CATEGORY_COLOR_PALETTE[0],
+      parentSearch: '',
+    });
+    setShowCategoriesModal(true);
+  };
+
+  const handleSaveCategory = async () => {
+    if (!categoryForm.name.trim()) {
+      return flashError(t('finance.categories.nameRequired'));
+    }
+    if (categoryForm.parentIds.length === 0) {
+      return flashError(t('finance.categories.parentsRequired'));
+    }
+
+    let next: IncomeCategory[];
+    if (editingCategory) {
+      next = incomeCategories.map((c) =>
+        c.id === editingCategory.id
+          ? {
+              ...c,
+              name: categoryForm.name.trim(),
+              parentIds: categoryForm.parentIds,
+              color: categoryForm.color,
+            }
+          : c
+      );
+      flashSuccess(t('finance.categories.updated'));
+    } else {
+      const created: IncomeCategory = {
+        id: `cat-${Date.now()}`,
+        name: categoryForm.name.trim(),
+        parentIds: categoryForm.parentIds,
+        color: categoryForm.color,
+        createdAt: new Date().toISOString(),
+      };
+      next = [...incomeCategories, created];
+      flashSuccess(t('finance.categories.created'));
+    }
+
+    setIncomeCategories(next);
+    await persistIncomeCategories(next);
+    setShowCategoriesModal(false);
+    resetCategoryForm();
+  };
+
+  const handleDeleteCategory = (cat: IncomeCategory) => {
+    Alert.alert(
+      t('finance.categories.deleteTitle'),
+      t('finance.categories.deleteMsg', { name: cat.name }),
+      [
+        { text: t('finance.cancel'), style: 'cancel' },
+        {
+          text: t('finance.delete'),
+          style: 'destructive',
+          onPress: async () => {
+            const next = incomeCategories.filter((c) => c.id !== cat.id);
+            setIncomeCategories(next);
+            await persistIncomeCategories(next);
+            flashSuccess(t('finance.categories.deleted'));
+          },
+        },
+      ]
+    );
+  };
+
+  const toggleCategoryParent = (parentId: string) => {
+    setCategoryForm((prev) => ({
+      ...prev,
+      parentIds: prev.parentIds.includes(parentId)
+        ? prev.parentIds.filter((x) => x !== parentId)
+        : [...prev.parentIds, parentId],
+    }));
+  };
+
+  const categoryParentSuggestions = useMemo(() => {
+    const q = categoryForm.parentSearch.trim().toLowerCase();
+    if (!q) return parents.slice(0, 30);
+    return parents
+      .filter(
+        (p) =>
+          (p.name || '').toLowerCase().includes(q) ||
+          (p.phone || '').includes(q)
+      )
+      .slice(0, 30);
+  }, [parents, categoryForm.parentSearch]);
+
+  // ============================================================
   // FETCHERS
   // ============================================================
   const fetchReferenceData = useCallback(async () => {
     if (!branchId) return;
     try {
       const [pRes, sRes, tRes, eRes]: any = await Promise.all([
-        apiClient.get(EP.parents, { params: { limit: 1000, branchId } }),
-        apiClient.get(EP.students, { params: { limit: 1000, branchId } }),
-        apiClient.get(EP.teachers, { params: { limit: 1000, branchId } }),
-        apiClient.get(EP.employees, { params: { limit: 1000, branchId } }),
+        apiClient.get(EP.parents, { limit: 1000, branchId }),
+        apiClient.get(EP.students, { limit: 1000, branchId }),
+        apiClient.get(EP.teachers, { limit: 1000, branchId }),
+        apiClient.get(EP.employees, { limit: 1000, branchId }),
       ]);
       setParents(parseParents(pRes));
       setStudents(parseStudents(sRes));
@@ -441,20 +1271,12 @@ export const FinancialManagementScreen: React.FC = () => {
     }
     setLoading(true);
     try {
-      const res: any = await apiClient.get(EP.dashboard, {
-        params: { branchId },
-      });
-      const data = unwrapData(res);
-      setDashboard(data || null);
+      const res: any = await apiClient.get(EP.dashboard, { branchId });
+      setDashboard(unwrapData(res) || null);
       setError('');
     } catch (err: any) {
-      if (isBranchError(err)) {
-        setError(t('finance.branchError'));
-      } else {
-        flashError(
-          err?.response?.data?.message || t('finance.dashboardFailed')
-        );
-      }
+      if (isBranchError(err)) setError(t('finance.branchError'));
+      else flashError(err?.response?.data?.message || t('finance.dashboardFailed'));
     } finally {
       setLoading(false);
     }
@@ -466,24 +1288,19 @@ export const FinancialManagementScreen: React.FC = () => {
       if (!silent) setLoading(true);
       try {
         const res: any = await apiClient.get(EP.monthlyStatus, {
-          params: { month: filterMonth, year: filterYear, branchId },
+          month: filterMonth,
+          year: filterYear,
+          branchId,
         });
         const data = unwrapData(res) || {};
         setMonthlyStatus(asArray<MonthlyStatusRow>(data.parentStatus));
         setMonthlySummary(data.summary || null);
         setHasDuesForMonth(!!data.hasDues);
-        setGeneratedMonths(
-          asArray<{ month: number; year: number }>(data.allDuesMonths)
-        );
+        setGeneratedMonths(asArray<{ month: number; year: number }>(data.allDuesMonths));
         setError('');
       } catch (err: any) {
-        if (isBranchError(err)) {
-          setError(t('finance.branchError'));
-        } else {
-          flashError(
-            err?.response?.data?.message || t('finance.monthlyStatusFailed')
-          );
-        }
+        if (isBranchError(err)) setError(t('finance.branchError'));
+        else flashError(err?.response?.data?.message || t('finance.monthlyStatusFailed'));
       } finally {
         if (!silent) setLoading(false);
       }
@@ -496,17 +1313,16 @@ export const FinancialManagementScreen: React.FC = () => {
     setLoading(true);
     try {
       const res: any = await apiClient.get(EP.expenses, {
-        params: { page: 1, limit: 500, branchId },
+        page: 1,
+        limit: 500,
+        branchId,
       });
       const data = unwrapData(res);
       setExpenses(asArray<Expense>(data?.expenses || data));
       setError('');
     } catch (err: any) {
-      if (isBranchError(err)) {
-        setError(t('finance.branchError'));
-      } else {
-        flashError(err?.response?.data?.message || t('finance.expensesFailed'));
-      }
+      if (isBranchError(err)) setError(t('finance.branchError'));
+      else flashError(err?.response?.data?.message || t('finance.expensesFailed'));
     } finally {
       setLoading(false);
     }
@@ -517,17 +1333,16 @@ export const FinancialManagementScreen: React.FC = () => {
     setLoading(true);
     try {
       const res: any = await apiClient.get(EP.payroll, {
-        params: { page: 1, limit: 500, branchId },
+        page: 1,
+        limit: 500,
+        branchId,
       });
       const data = unwrapData(res);
       setPayroll(asArray<Payroll>(data?.payroll || data));
       setError('');
     } catch (err: any) {
-      if (isBranchError(err)) {
-        setError(t('finance.branchError'));
-      } else {
-        flashError(err?.response?.data?.message || t('finance.payrollFailed'));
-      }
+      if (isBranchError(err)) setError(t('finance.branchError'));
+      else flashError(err?.response?.data?.message || t('finance.payrollFailed'));
     } finally {
       setLoading(false);
     }
@@ -539,20 +1354,14 @@ export const FinancialManagementScreen: React.FC = () => {
       setLoading(true);
       try {
         const res: any = await apiClient.get(EP.parentHistory(parentId), {
-          params: { branchId },
+          branchId,
         });
-        const data = unwrapData(res) || {};
-        setParentHistory(data);
+        setParentHistory(unwrapData(res) || {});
         setShowHistoryModal(true);
         setError('');
       } catch (err: any) {
-        if (isBranchError(err)) {
-          setError(t('finance.branchError'));
-        } else {
-          flashError(
-            err?.response?.data?.message || t('finance.parentHistoryFailed')
-          );
-        }
+        if (isBranchError(err)) setError(t('finance.branchError'));
+        else flashError(err?.response?.data?.message || t('finance.parentHistoryFailed'));
       } finally {
         setLoading(false);
       }
@@ -593,9 +1402,7 @@ export const FinancialManagementScreen: React.FC = () => {
             fetchMonthlyStatus(true);
           }
         })
-        .catch(() => {
-          // silent
-        });
+        .catch(() => {});
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, filterMonth, filterYear, branchId]);
@@ -630,6 +1437,62 @@ export const FinancialManagementScreen: React.FC = () => {
       outstandingDues: 0,
     };
   }, [dashboard]);
+
+  // ---- Income categories computed income ----
+  const categoryIncome = useMemo(() => {
+    const rows =
+      monthlyStatus && monthlyStatus.length > 0
+        ? monthlyStatus
+        : asArray<any>(dashboard?.parentStatus);
+
+    return incomeCategories.map((cat) => {
+      const parentSet = new Set(cat.parentIds);
+      let totalPaid = 0;
+      let totalDue = 0;
+      let parentsMatched = 0;
+
+      rows.forEach((row: any) => {
+        const pid = row.parentId || row._id;
+        if (!pid || !parentSet.has(String(pid))) return;
+        parentsMatched += 1;
+        totalPaid += Number(row.totalPaid) || 0;
+        totalDue += Number(row.totalDue) || 0;
+      });
+
+      const pctOfRevenue =
+        stats.totalRevenue > 0 ? (totalPaid / stats.totalRevenue) * 100 : 0;
+
+      return {
+        ...cat,
+        totalPaid,
+        totalDue,
+        balance: totalDue - totalPaid,
+        parentsMatched,
+        pctOfRevenue,
+      };
+    });
+  }, [incomeCategories, monthlyStatus, dashboard, stats.totalRevenue]);
+
+  const uncategorizedIncome = useMemo(() => {
+    if (incomeCategories.length === 0) return null;
+    const categorized = new Set<string>();
+    incomeCategories.forEach((c) => c.parentIds.forEach((id) => categorized.add(String(id))));
+
+    const rows =
+      monthlyStatus && monthlyStatus.length > 0
+        ? monthlyStatus
+        : asArray<any>(dashboard?.parentStatus);
+
+    let totalPaid = 0;
+    let totalDue = 0;
+    rows.forEach((row: any) => {
+      const pid = row.parentId || row._id;
+      if (!pid || categorized.has(String(pid))) return;
+      totalPaid += Number(row.totalPaid) || 0;
+      totalDue += Number(row.totalDue) || 0;
+    });
+    return { totalPaid, totalDue, balance: totalDue - totalPaid };
+  }, [incomeCategories, monthlyStatus, dashboard]);
 
   const filteredParents = useMemo(() => {
     return monthlyStatus.filter((p) => {
@@ -683,7 +1546,8 @@ export const FinancialManagementScreen: React.FC = () => {
   const selectedParentChildren = useMemo(() => {
     if (!paymentForm.parentId) return [];
     return students.filter(
-      (s) => s.parentId === paymentForm.parentId || s.parent === paymentForm.parentId
+      (s) =>
+        s.parentId === paymentForm.parentId || s.parent === paymentForm.parentId
     );
   }, [students, paymentForm.parentId]);
 
@@ -746,23 +1610,14 @@ export const FinancialManagementScreen: React.FC = () => {
   };
 
   const handleCreatePayment = async () => {
-    if (!branchId) {
-      flashError(t('finance.branchRequired'));
-      return;
-    }
-    if (!paymentForm.parentId) {
-      flashError(t('finance.selectParent'));
-      return;
-    }
-    if (paymentForm.selectedChildren.length === 0) {
-      flashError(t('finance.selectChild'));
-      return;
-    }
+    if (!branchId) return flashError(t('finance.branchRequired'));
+    if (!paymentForm.parentId) return flashError(t('finance.selectParent'));
+    if (paymentForm.selectedChildren.length === 0)
+      return flashError(t('finance.selectChild'));
     const amount = parseFloat(paymentForm.amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      flashError(t('finance.validAmount'));
-      return;
-    }
+    if (!Number.isFinite(amount) || amount <= 0)
+      return flashError(t('finance.validAmount'));
+
     setSaving(true);
     try {
       await apiClient.post(EP.payments, {
@@ -789,19 +1644,13 @@ export const FinancialManagementScreen: React.FC = () => {
   };
 
   const handleSaveExpense = async () => {
-    if (!branchId) {
-      flashError(t('finance.branchRequired'));
-      return;
-    }
-    if (!expenseForm.description.trim() || !expenseForm.amount) {
-      flashError(t('finance.descAmountRequired'));
-      return;
-    }
+    if (!branchId) return flashError(t('finance.branchRequired'));
+    if (!expenseForm.description.trim() || !expenseForm.amount)
+      return flashError(t('finance.descAmountRequired'));
     const amount = parseFloat(expenseForm.amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      flashError(t('finance.validAmount'));
-      return;
-    }
+    if (!Number.isFinite(amount) || amount <= 0)
+      return flashError(t('finance.validAmount'));
+
     setSaving(true);
     try {
       const payload = {
@@ -833,19 +1682,13 @@ export const FinancialManagementScreen: React.FC = () => {
   };
 
   const handleSavePayroll = async () => {
-    if (!branchId) {
-      flashError(t('finance.branchRequired'));
-      return;
-    }
-    if (!payrollForm.employeeName.trim() || !payrollForm.amountPaid) {
-      flashError(t('finance.nameAmountRequired'));
-      return;
-    }
+    if (!branchId) return flashError(t('finance.branchRequired'));
+    if (!payrollForm.employeeName.trim() || !payrollForm.amountPaid)
+      return flashError(t('finance.nameAmountRequired'));
     const amountPaid = parseFloat(payrollForm.amountPaid);
-    if (!Number.isFinite(amountPaid) || amountPaid <= 0) {
-      flashError(t('finance.validAmount'));
-      return;
-    }
+    if (!Number.isFinite(amountPaid) || amountPaid <= 0)
+      return flashError(t('finance.validAmount'));
+
     setSaving(true);
     try {
       const payload = {
@@ -896,9 +1739,7 @@ export const FinancialManagementScreen: React.FC = () => {
               flashSuccess(t('finance.expenseDeleted'));
               if (activeTab === 'dashboard') fetchDashboard();
             } catch (err: any) {
-              flashError(
-                err?.response?.data?.message || t('finance.expenseDeleteFailed')
-              );
+              flashError(err?.response?.data?.message || t('finance.expenseDeleteFailed'));
             }
           },
         },
@@ -922,9 +1763,7 @@ export const FinancialManagementScreen: React.FC = () => {
               flashSuccess(t('finance.payrollDeleted'));
               if (activeTab === 'dashboard') fetchDashboard();
             } catch (err: any) {
-              flashError(
-                err?.response?.data?.message || t('finance.payrollDeleteFailed')
-              );
+              flashError(err?.response?.data?.message || t('finance.payrollDeleteFailed'));
             }
           },
         },
@@ -935,10 +1774,7 @@ export const FinancialManagementScreen: React.FC = () => {
   const handleDeleteHistoryPayment = (payment: any) => {
     const paymentId = payment?._id || payment?.id;
     const parentId = selectedParent?._id;
-    if (!paymentId || !parentId) {
-      flashError(t('finance.missingIds'));
-      return;
-    }
+    if (!paymentId || !parentId) return flashError(t('finance.missingIds'));
     Alert.alert(t('finance.deletePaymentTitle'), t('finance.deletePaymentMsg'), [
       { text: t('finance.cancel'), style: 'cancel' },
       {
@@ -952,9 +1788,7 @@ export const FinancialManagementScreen: React.FC = () => {
             await fetchMonthlyStatus(true);
             if (activeTab === 'dashboard') fetchDashboard();
           } catch (err: any) {
-            flashError(
-              err?.response?.data?.message || t('finance.deletePaymentFailed')
-            );
+            flashError(err?.response?.data?.message || t('finance.deletePaymentFailed'));
           }
         },
       },
@@ -962,10 +1796,7 @@ export const FinancialManagementScreen: React.FC = () => {
   };
 
   const handleGenerateDues = async () => {
-    if (!branchId) {
-      flashError(t('finance.branchRequired'));
-      return;
-    }
+    if (!branchId) return flashError(t('finance.branchRequired'));
     setSaving(true);
     try {
       const res: any = await apiClient.post(EP.generateDues, {
@@ -987,14 +1818,12 @@ export const FinancialManagementScreen: React.FC = () => {
   };
 
   const handleCancelDues = async () => {
-    if (!branchId) {
-      flashError(t('finance.branchRequired'));
-      return;
-    }
+    if (!branchId) return flashError(t('finance.branchRequired'));
     setSaving(true);
     try {
       const res: any = await apiClient.delete(EP.cancelDues, {
-        params: { month: generateMonth, year: generateYear },
+        month: generateMonth,
+        year: generateYear,
       });
       const data = unwrapData(res);
       flashSuccess(data?.message || t('finance.duesCancelled'));
@@ -1009,7 +1838,80 @@ export const FinancialManagementScreen: React.FC = () => {
   };
 
   // ============================================================
-  // RENDER: HEADER
+  // PRINT
+  // ============================================================
+  const handlePrint = async (type: PrintType, data: any) => {
+    setPrintData(data);
+    setPrintType(type);
+    setShowPrintModal(true);
+  };
+
+  const handlePrintNow = async () => {
+    if (!printData) return;
+    await printFinanceSheet(printType, printData, invoiceSettings);
+    setShowPrintModal(false);
+  };
+
+  const handleShareNow = async () => {
+    if (!printData) return;
+    await shareFinanceSheetAsPdf(printType, printData, invoiceSettings);
+    setShowPrintModal(false);
+  };
+
+  // ============================================================
+  // INVOICE SETTINGS
+  // ============================================================
+  const pickLogo = async () => {
+    if (!ImagePicker) {
+      Alert.alert(
+        t('finance.invoiceModal.imagePickerMissing') || 'Image Picker unavailable',
+        t('finance.invoiceModal.imagePickerMissingMsg') ||
+          'Please install expo-image-picker to enable logo upload.'
+      );
+      return;
+    }
+    try {
+      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!perm.granted) {
+        Alert.alert(
+          t('finance.invoiceModal.permissionTitle') || 'Permission needed',
+          t('finance.invoiceModal.permissionMsg') ||
+            'Please allow access to your photos.'
+        );
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions?.Images ?? 'Images',
+        allowsEditing: true,
+        aspect: [1, 1],
+        quality: 0.6,
+        base64: true,
+      });
+      if (result.canceled) return;
+      const asset = result.assets?.[0];
+      if (!asset?.base64) return;
+      const mime = asset.mimeType || 'image/png';
+      const uri = `data:${mime};base64,${asset.base64}`;
+      setInvoicePreview(uri);
+      setInvoiceSettings((prev) => ({ ...prev, logo: uri }));
+    } catch (e) {
+      console.warn('pickLogo failed', e);
+    }
+  };
+
+  const removeLogo = () => {
+    setInvoicePreview('');
+    setInvoiceSettings((prev) => ({ ...prev, logo: null }));
+  };
+
+  const handleSaveInvoiceSettings = async () => {
+    await persistInvoiceSettings(invoiceSettings);
+    flashSuccess(t('finance.invoiceModal.saved') || 'Invoice settings saved');
+    setShowInvoiceModal(false);
+  };
+
+  // ============================================================
+  // HEADER
   // ============================================================
   const renderHeader = () => (
     <View style={styles.header}>
@@ -1027,8 +1929,19 @@ export const FinancialManagementScreen: React.FC = () => {
             : t('finance.subtitlePayroll')}
         </Text>
       </View>
-
       <View style={styles.headerActions}>
+        <TouchableOpacity
+          style={[styles.headerIconBtn, { backgroundColor: COLORS.tealLight }]}
+          onPress={openNewCategory}
+        >
+          <Ionicons name="pricetags-outline" size={18} color={COLORS.teal} />
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.headerIconBtn, { backgroundColor: COLORS.purpleLight }]}
+          onPress={() => setShowInvoiceModal(true)}
+        >
+          <Ionicons name="settings-outline" size={18} color={COLORS.purple} />
+        </TouchableOpacity>
         {activeTab === 'payments' && (
           <TouchableOpacity
             style={[styles.headerIconBtn, { backgroundColor: COLORS.primary }]}
@@ -1071,9 +1984,6 @@ export const FinancialManagementScreen: React.FC = () => {
     </View>
   );
 
-  // ============================================================
-  // NO-BRANCH GATE
-  // ============================================================
   if (!branchId) {
     return (
       <SafeAreaView style={styles.container} edges={['top']}>
@@ -1088,7 +1998,7 @@ export const FinancialManagementScreen: React.FC = () => {
   }
 
   // ============================================================
-  // RENDER: DASHBOARD
+  // DASHBOARD
   // ============================================================
   const renderDashboard = () => {
     const s = stats;
@@ -1097,6 +2007,7 @@ export const FinancialManagementScreen: React.FC = () => {
     const recentPayments = asArray<any>(dashboard?.recentPayments);
     const topParents = asArray<any>(dashboard?.topParents);
     const expenseBreakdown = asArray<any>(dashboard?.expenseBreakdown);
+    const monthlyTrend = asArray<any>(dashboard?.monthlyTrend);
 
     return (
       <ScrollView
@@ -1124,7 +2035,6 @@ export const FinancialManagementScreen: React.FC = () => {
               {fmtMoney(s.totalRevenue)}
             </Text>
           </View>
-
           <View style={styles.statTile}>
             <View style={[styles.statIcon, { backgroundColor: COLORS.redLight }]}>
               <Ionicons name="trending-down" size={20} color={COLORS.red} />
@@ -1136,7 +2046,6 @@ export const FinancialManagementScreen: React.FC = () => {
               {fmtMoney(s.totalExpenses)}
             </Text>
           </View>
-
           <View style={styles.statTile}>
             <View
               style={[styles.statIcon, { backgroundColor: COLORS.purpleLight }]}
@@ -1150,7 +2059,6 @@ export const FinancialManagementScreen: React.FC = () => {
               {fmtMoney(s.totalPayroll)}
             </Text>
           </View>
-
           <View style={styles.statTile}>
             <View
               style={[
@@ -1183,10 +2091,7 @@ export const FinancialManagementScreen: React.FC = () => {
 
         <View style={styles.outstandingCard}>
           <View
-            style={[
-              styles.outstandingIcon,
-              { backgroundColor: COLORS.amberLight },
-            ]}
+            style={[styles.outstandingIcon, { backgroundColor: COLORS.amberLight }]}
           >
             <Ionicons name="alert-circle" size={24} color={COLORS.amber} />
           </View>
@@ -1237,6 +2142,53 @@ export const FinancialManagementScreen: React.FC = () => {
           </View>
         </View>
 
+        {monthlyTrend.length > 0 && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>
+              {t('finance.dashboard.monthlyTrend')}
+            </Text>
+            {monthlyTrend.map((item: any, idx: number) => {
+              const maxRevenue = Math.max(
+                ...monthlyTrend.map((i: any) => i.revenue || 0),
+                1
+              );
+              const revPct = Math.min(((item.revenue || 0) / maxRevenue) * 100, 100);
+              const expPct = Math.min(
+                ((item.expenses || 0) / maxRevenue) * 100,
+                100
+              );
+              return (
+                <View key={`${item.month}-${idx}`} style={styles.trendRow}>
+                  <Text style={styles.trendMonth}>{esc(item.month)}</Text>
+                  <View style={styles.trendBarWrap}>
+                    <View style={[styles.trendBarRev, { width: `${revPct}%` }]} />
+                  </View>
+                  <View style={styles.trendBarWrap}>
+                    <View style={[styles.trendBarExp, { width: `${expPct}%` }]} />
+                  </View>
+                  <Text style={styles.trendAmount}>
+                    {fmtMoney(item.revenue)}
+                  </Text>
+                </View>
+              );
+            })}
+            <View style={styles.legend}>
+              <View style={styles.legendDot}>
+                <View style={[styles.dotSquare, { backgroundColor: COLORS.primary }]} />
+                <Text style={styles.legendText}>
+                  {t('finance.dashboard.revenue')}
+                </Text>
+              </View>
+              <View style={styles.legendDot}>
+                <View style={[styles.dotSquare, { backgroundColor: COLORS.red }]} />
+                <Text style={styles.legendText}>
+                  {t('finance.dashboard.expenses')}
+                </Text>
+              </View>
+            </View>
+          </View>
+        )}
+
         {expenseBreakdown.length > 0 && (
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>
@@ -1250,10 +2202,7 @@ export const FinancialManagementScreen: React.FC = () => {
                 ? t(`finance.expenseCategories.${catKey}`)
                 : item.category;
               return (
-                <View
-                  key={`${item.category}-${idx}`}
-                  style={styles.breakdownRow}
-                >
+                <View key={`${item.category}-${idx}`} style={styles.breakdownRow}>
                   <Text style={styles.breakdownLabel} numberOfLines={1}>
                     {label}
                   </Text>
@@ -1302,6 +2251,120 @@ export const FinancialManagementScreen: React.FC = () => {
           </View>
         )}
 
+        {incomeCategories.length > 0 && (
+          <View style={styles.section}>
+            <View style={styles.sectionHeaderRow}>
+              <Text style={styles.sectionTitle}>
+                {t('finance.dashboard.incomeCategories')}
+              </Text>
+              <TouchableOpacity
+                style={styles.sectionHeaderBtn}
+                onPress={openNewCategory}
+              >
+                <Ionicons name="add" size={14} color={COLORS.teal} />
+                <Text style={styles.sectionHeaderBtnText}>
+                  {t('finance.categories.manage')}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
+            {categoryIncome.map((cat) => {
+              const pct = Math.min(cat.pctOfRevenue, 100);
+              return (
+                <TouchableOpacity
+                  key={cat.id}
+                  style={styles.categoryCard}
+                  activeOpacity={0.8}
+                  onPress={() => openEditCategory(cat)}
+                >
+                  <View style={styles.categoryHeaderRow}>
+                    <View
+                      style={[
+                        styles.categoryColorDot,
+                        { backgroundColor: cat.color || COLORS.teal },
+                      ]}
+                    />
+                    <Text style={styles.categoryName} numberOfLines={1}>
+                      {cat.name}
+                    </Text>
+                    <Text style={styles.categoryParents}>
+                      {t('finance.categories.parentCount', {
+                        count: cat.parentsMatched,
+                      })}
+                    </Text>
+                    <TouchableOpacity
+                      style={styles.categoryDeleteBtn}
+                      onPress={() => handleDeleteCategory(cat)}
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    >
+                      <Ionicons
+                        name="trash-outline"
+                        size={14}
+                        color={COLORS.red}
+                      />
+                    </TouchableOpacity>
+                  </View>
+                  <View style={styles.categoryAmountRow}>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.categoryAmountLabel}>
+                        {t('finance.categories.collected')}
+                      </Text>
+                      <Text
+                        style={[
+                          styles.categoryAmount,
+                          { color: cat.color || COLORS.teal },
+                        ]}
+                      >
+                        {fmtMoney(cat.totalPaid)}
+                      </Text>
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.categoryAmountLabel}>
+                        {t('finance.categories.outstanding')}
+                      </Text>
+                      <Text
+                        style={[
+                          styles.categoryAmount,
+                          { color: COLORS.amber, fontSize: 14 },
+                        ]}
+                      >
+                        {fmtMoney(cat.balance)}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={styles.categoryBarWrap}>
+                    <View
+                      style={[
+                        styles.categoryBar,
+                        {
+                          width: `${pct}%`,
+                          backgroundColor: cat.color || COLORS.teal,
+                        },
+                      ]}
+                    />
+                  </View>
+                  <Text style={styles.categoryPct}>
+                    {t('finance.categories.ofRevenue', {
+                      pct: cat.pctOfRevenue.toFixed(1),
+                    })}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+
+            {uncategorizedIncome && uncategorizedIncome.totalPaid > 0 && (
+              <View style={styles.categoryUncatRow}>
+                <Text style={styles.categoryUncatLabel}>
+                  {t('finance.categories.uncategorized')}
+                </Text>
+                <Text style={styles.categoryUncatValue}>
+                  {fmtMoney(uncategorizedIncome.totalPaid)}
+                </Text>
+              </View>
+            )}
+          </View>
+        )}
+
         {recentPayments.length > 0 && (
           <View style={styles.section}>
             <Text style={styles.sectionTitle}>
@@ -1334,6 +2397,16 @@ export const FinancialManagementScreen: React.FC = () => {
                   <Text style={styles.recentAmount}>
                     {fmtMoney(p.amount)}
                   </Text>
+                  <TouchableOpacity
+                    style={styles.iconBtn}
+                    onPress={() => handlePrint('payment', p)}
+                  >
+                    <Ionicons
+                      name="print-outline"
+                      size={16}
+                      color={COLORS.purple}
+                    />
+                  </TouchableOpacity>
                 </View>
               );
             })}
@@ -1360,7 +2433,7 @@ export const FinancialManagementScreen: React.FC = () => {
   };
 
   // ============================================================
-  // RENDER: PAYMENTS
+  // PAYMENTS
   // ============================================================
   const renderPayments = () => {
     const nowM = new Date().getMonth() + 1;
@@ -1427,10 +2500,7 @@ export const FinancialManagementScreen: React.FC = () => {
         <View style={styles.actionRow}>
           {isPast && (
             <TouchableOpacity
-              style={[
-                styles.smallActionBtn,
-                { backgroundColor: COLORS.primary },
-              ]}
+              style={[styles.smallActionBtn, { backgroundColor: COLORS.primary }]}
               onPress={() => {
                 setGenerateMonth(filterMonth);
                 setGenerateYear(filterYear);
@@ -1500,11 +2570,7 @@ export const FinancialManagementScreen: React.FC = () => {
               >
                 {s === 'All'
                   ? t('finance.payments.all')
-                  : t(
-                      `finance.paymentStatus.${
-                        STATUS_KEY[s as PaymentStatus]
-                      }`
-                    )}
+                  : t(`finance.paymentStatus.${STATUS_KEY[s as PaymentStatus]}`)}
               </Text>
             </TouchableOpacity>
           ))}
@@ -1559,9 +2625,7 @@ export const FinancialManagementScreen: React.FC = () => {
                       <Text style={styles.parentPhone}>{item.phone}</Text>
                       <Text style={styles.parentChildren}>
                         {childCount === 1
-                          ? t('finance.payments.childLabel', {
-                              count: childCount,
-                            })
+                          ? t('finance.payments.childLabel', { count: childCount })
                           : t('finance.payments.childLabelPlural', {
                               count: childCount,
                             })}
@@ -1572,9 +2636,7 @@ export const FinancialManagementScreen: React.FC = () => {
                         style={[styles.statusBadge, { backgroundColor: sc.bg }]}
                       >
                         <Text style={[styles.statusText, { color: sc.text }]}>
-                          {t(
-                            `finance.paymentStatus.${STATUS_KEY[item.status]}`
-                          )}
+                          {t(`finance.paymentStatus.${STATUS_KEY[item.status]}`)}
                         </Text>
                       </View>
                       <Text style={styles.balanceLabel}>
@@ -1600,9 +2662,7 @@ export const FinancialManagementScreen: React.FC = () => {
                           ...prev,
                           parentSearch: item.parentName,
                           parentId: item.parentId,
-                          selectedChildren: (item.children || []).map(
-                            (c) => c._id
-                          ),
+                          selectedChildren: (item.children || []).map((c) => c._id),
                           month: filterMonth,
                           year: filterYear,
                         }));
@@ -1616,6 +2676,36 @@ export const FinancialManagementScreen: React.FC = () => {
                       />
                       <Text style={styles.parentActionText}>
                         {t('finance.payments.recordPayment')}
+                      </Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      style={[styles.parentActionBtn, { borderColor: COLORS.purple }]}
+                      onPress={async () => {
+                        const parent = parents.find((p) => p._id === item.parentId);
+                        if (parent) {
+                          try {
+                            const res: any = await apiClient.get(
+                              EP.parentHistory(item.parentId),
+                              { branchId }
+                            );
+                            const data = unwrapData(res) || {};
+                            handlePrint('history', {
+                              ...parent,
+                              summary: data.summary,
+                              monthlyHistory: data.monthlyHistory,
+                              payments: data.payments,
+                            });
+                          } catch (e) {
+                            flashError(t('finance.parentHistoryFailed'));
+                          }
+                        }
+                      }}
+                    >
+                      <Ionicons name="print-outline" size={16} color={COLORS.purple} />
+                      <Text
+                        style={[styles.parentActionText, { color: COLORS.purple }]}
+                      >
+                        {t('finance.payments.printLedger')}
                       </Text>
                     </TouchableOpacity>
                   </View>
@@ -1647,12 +2737,10 @@ export const FinancialManagementScreen: React.FC = () => {
               {t('finance.paymentStatus.paid')} {monthlySummary.paidCount}
             </Text>
             <Text style={[styles.summaryBarText, { color: COLORS.amber }]}>
-              {t('finance.paymentStatus.partial')}{' '}
-              {monthlySummary.partialCount}
+              {t('finance.paymentStatus.partial')} {monthlySummary.partialCount}
             </Text>
             <Text style={[styles.summaryBarText, { color: COLORS.red }]}>
-              {t('finance.paymentStatus.unpaid')}{' '}
-              {monthlySummary.unpaidCount}
+              {t('finance.paymentStatus.unpaid')} {monthlySummary.unpaidCount}
             </Text>
           </View>
         )}
@@ -1661,7 +2749,7 @@ export const FinancialManagementScreen: React.FC = () => {
   };
 
   // ============================================================
-  // RENDER: EXPENSES
+  // EXPENSES
   // ============================================================
   const renderExpenses = () => (
     <>
@@ -1721,9 +2809,7 @@ export const FinancialManagementScreen: React.FC = () => {
       {loading && expenses.length === 0 ? (
         <View style={styles.loadingWrap}>
           <ActivityIndicator size="large" color={COLORS.primary} />
-          <Text style={styles.loadingText}>
-            {t('finance.expenses.loading')}
-          </Text>
+          <Text style={styles.loadingText}>{t('finance.expenses.loading')}</Text>
         </View>
       ) : (
         <FlatList
@@ -1760,10 +2846,7 @@ export const FinancialManagementScreen: React.FC = () => {
                     <Ionicons name="arrow-up" size={20} color={COLORS.red} />
                   </View>
                   <View style={{ flex: 1 }}>
-                    <Text
-                      style={styles.expenseDescription}
-                      numberOfLines={1}
-                    >
+                    <Text style={styles.expenseDescription} numberOfLines={1}>
                       {item.description}
                     </Text>
                     <View style={styles.expenseMeta}>
@@ -1800,9 +2883,7 @@ export const FinancialManagementScreen: React.FC = () => {
                             reference: item.reference || '',
                             notes: item.notes || '',
                             date: item.date
-                              ? new Date(item.date)
-                                  .toISOString()
-                                  .split('T')[0]
+                              ? new Date(item.date).toISOString().split('T')[0]
                               : new Date().toISOString().split('T')[0],
                           });
                           setShowExpenseModal(true);
@@ -1851,7 +2932,7 @@ export const FinancialManagementScreen: React.FC = () => {
   );
 
   // ============================================================
-  // RENDER: PAYROLL
+  // PAYROLL
   // ============================================================
   const renderPayroll = () => (
     <>
@@ -1925,9 +3006,7 @@ export const FinancialManagementScreen: React.FC = () => {
       {loading && payroll.length === 0 ? (
         <View style={styles.loadingWrap}>
           <ActivityIndicator size="large" color={COLORS.primary} />
-          <Text style={styles.loadingText}>
-            {t('finance.payroll.loading')}
-          </Text>
+          <Text style={styles.loadingText}>{t('finance.payroll.loading')}</Text>
         </View>
       ) : (
         <FlatList
@@ -1962,10 +3041,7 @@ export const FinancialManagementScreen: React.FC = () => {
                     ]}
                   >
                     <Text
-                      style={[
-                        styles.payrollAvatarText,
-                        { color: COLORS.purple },
-                      ]}
+                      style={[styles.payrollAvatarText, { color: COLORS.purple }]}
                     >
                       {initials(item.employeeName)}
                     </Text>
@@ -1985,9 +3061,7 @@ export const FinancialManagementScreen: React.FC = () => {
                     >
                       <Text style={[styles.statusText, { color: sc.text }]}>
                         {t(
-                          `finance.payrollStatus.${
-                            PAYROLL_STATUS_KEY[item.status]
-                          }`
+                          `finance.payrollStatus.${PAYROLL_STATUS_KEY[item.status]}`
                         )}
                       </Text>
                     </View>
@@ -2013,9 +3087,7 @@ export const FinancialManagementScreen: React.FC = () => {
                         employeeName: item.employeeName,
                         role: item.role,
                         baseSalary: String(item.baseSalary || ''),
-                        amountPaid: String(
-                          item.amountPaid ?? item.netPay ?? ''
-                        ),
+                        amountPaid: String(item.amountPaid ?? item.netPay ?? ''),
                         paymentMethod:
                           (item.paymentMethod as PaymentMethod) ||
                           'Mobile Money',
@@ -2034,14 +3106,22 @@ export const FinancialManagementScreen: React.FC = () => {
                       color={COLORS.primary}
                     />
                     <Text style={styles.parentActionText}>
-                      {t('goals.edit')}
+                      {t('finance.edit')}
                     </Text>
                   </TouchableOpacity>
                   <TouchableOpacity
-                    style={[
-                      styles.parentActionBtn,
-                      { borderColor: COLORS.red },
-                    ]}
+                    style={[styles.parentActionBtn, { borderColor: COLORS.purple }]}
+                    onPress={() => handlePrint('payroll', item)}
+                  >
+                    <Ionicons name="print-outline" size={16} color={COLORS.purple} />
+                    <Text
+                      style={[styles.parentActionText, { color: COLORS.purple }]}
+                    >
+                      {t('finance.print')}
+                    </Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.parentActionBtn, { borderColor: COLORS.red }]}
                     onPress={() => handleDeletePayroll(item)}
                   >
                     <Ionicons
@@ -2050,10 +3130,7 @@ export const FinancialManagementScreen: React.FC = () => {
                       color={COLORS.red}
                     />
                     <Text
-                      style={[
-                        styles.parentActionText,
-                        { color: COLORS.red },
-                      ]}
+                      style={[styles.parentActionText, { color: COLORS.red }]}
                     >
                       {t('finance.delete')}
                     </Text>
@@ -2170,9 +3247,7 @@ export const FinancialManagementScreen: React.FC = () => {
                         setPaymentForm((prev) => ({
                           ...prev,
                           selectedChildren: checked
-                            ? prev.selectedChildren.filter(
-                                (x) => x !== c._id
-                              )
+                            ? prev.selectedChildren.filter((x) => x !== c._id)
                             : [...prev.selectedChildren, c._id],
                         }))
                       }
@@ -2223,17 +3298,13 @@ export const FinancialManagementScreen: React.FC = () => {
                     paymentForm.paymentMethod === m && styles.chipActive,
                   ]}
                   onPress={() =>
-                    setPaymentForm((prev) => ({
-                      ...prev,
-                      paymentMethod: m,
-                    }))
+                    setPaymentForm((prev) => ({ ...prev, paymentMethod: m }))
                   }
                 >
                   <Text
                     style={[
                       styles.chipText,
-                      paymentForm.paymentMethod === m &&
-                        styles.chipTextActive,
+                      paymentForm.paymentMethod === m && styles.chipTextActive,
                     ]}
                   >
                     {t(`finance.methods.${PAYMENT_METHOD_KEY[m]}`)}
@@ -2253,10 +3324,7 @@ export const FinancialManagementScreen: React.FC = () => {
                   style={styles.formInput}
                   value={paymentForm.reference}
                   onChangeText={(v) =>
-                    setPaymentForm((prev) => ({
-                      ...prev,
-                      reference: v,
-                    }))
+                    setPaymentForm((prev) => ({ ...prev, reference: v }))
                   }
                   placeholder={
                     paymentForm.paymentMethod === 'Mobile Money'
@@ -2264,11 +3332,6 @@ export const FinancialManagementScreen: React.FC = () => {
                       : t('finance.paymentModal.bankReferencePlaceholder')
                   }
                   placeholderTextColor="#A0AAA5"
-                  keyboardType={
-                    paymentForm.paymentMethod === 'Bank Transfer'
-                      ? 'number-pad'
-                      : 'default'
-                  }
                 />
               </>
             )}
@@ -2437,17 +3500,13 @@ export const FinancialManagementScreen: React.FC = () => {
                     expenseForm.paymentMethod === m && styles.chipActive,
                   ]}
                   onPress={() =>
-                    setExpenseForm((prev) => ({
-                      ...prev,
-                      paymentMethod: m,
-                    }))
+                    setExpenseForm((prev) => ({ ...prev, paymentMethod: m }))
                   }
                 >
                   <Text
                     style={[
                       styles.chipText,
-                      expenseForm.paymentMethod === m &&
-                        styles.chipTextActive,
+                      expenseForm.paymentMethod === m && styles.chipTextActive,
                     ]}
                   >
                     {t(`finance.methods.${PAYMENT_METHOD_KEY[m]}`)}
@@ -2556,9 +3615,7 @@ export const FinancialManagementScreen: React.FC = () => {
                       employeeName: '',
                     }))
                   }
-                  placeholder={t(
-                    'finance.payrollModal.searchEmployeePlaceholder'
-                  )}
+                  placeholder={t('finance.payrollModal.searchEmployeePlaceholder')}
                   placeholderTextColor="#A0AAA5"
                 />
                 {employeeSuggestions.length > 0 && !payrollForm.employeeId && (
@@ -2654,17 +3711,13 @@ export const FinancialManagementScreen: React.FC = () => {
                     payrollForm.paymentMethod === m && styles.chipActive,
                   ]}
                   onPress={() =>
-                    setPayrollForm((prev) => ({
-                      ...prev,
-                      paymentMethod: m,
-                    }))
+                    setPayrollForm((prev) => ({ ...prev, paymentMethod: m }))
                   }
                 >
                   <Text
                     style={[
                       styles.chipText,
-                      payrollForm.paymentMethod === m &&
-                        styles.chipTextActive,
+                      payrollForm.paymentMethod === m && styles.chipTextActive,
                     ]}
                   >
                     {t(`finance.methods.${PAYMENT_METHOD_KEY[m]}`)}
@@ -2677,29 +3730,27 @@ export const FinancialManagementScreen: React.FC = () => {
               {t('finance.payrollModal.status')}
             </Text>
             <View style={styles.chipRow}>
-              {(['Paid', 'Pending', 'Cancelled'] as PayrollStatus[]).map(
-                (s) => (
-                  <TouchableOpacity
-                    key={s}
+              {(['Paid', 'Pending', 'Cancelled'] as PayrollStatus[]).map((s) => (
+                <TouchableOpacity
+                  key={s}
+                  style={[
+                    styles.chip,
+                    payrollForm.status === s && styles.chipActive,
+                  ]}
+                  onPress={() =>
+                    setPayrollForm((prev) => ({ ...prev, status: s }))
+                  }
+                >
+                  <Text
                     style={[
-                      styles.chip,
-                      payrollForm.status === s && styles.chipActive,
+                      styles.chipText,
+                      payrollForm.status === s && styles.chipTextActive,
                     ]}
-                    onPress={() =>
-                      setPayrollForm((prev) => ({ ...prev, status: s }))
-                    }
                   >
-                    <Text
-                      style={[
-                        styles.chipText,
-                        payrollForm.status === s && styles.chipTextActive,
-                      ]}
-                    >
-                      {t(`finance.payrollStatus.${PAYROLL_STATUS_KEY[s]}`)}
-                    </Text>
-                  </TouchableOpacity>
-                )
-              )}
+                    {t(`finance.payrollStatus.${PAYROLL_STATUS_KEY[s]}`)}
+                  </Text>
+                </TouchableOpacity>
+              ))}
             </View>
 
             <Text style={styles.formLabel}>
@@ -2773,6 +3824,19 @@ export const FinancialManagementScreen: React.FC = () => {
                 {selectedParent?.name || ''}
               </Text>
             </View>
+            <TouchableOpacity
+              style={[styles.headerIconBtn, { backgroundColor: COLORS.purpleLight }]}
+              onPress={() =>
+                handlePrint('history', {
+                  ...selectedParent,
+                  summary: parentHistory?.summary,
+                  monthlyHistory: parentHistory?.monthlyHistory,
+                  payments: parentHistory?.payments,
+                })
+              }
+            >
+              <Ionicons name="print-outline" size={18} color={COLORS.purple} />
+            </TouchableOpacity>
             <TouchableOpacity
               style={styles.modalCloseBtn}
               onPress={() => setShowHistoryModal(false)}
@@ -2875,9 +3939,7 @@ export const FinancialManagementScreen: React.FC = () => {
                     />
                     <Text style={styles.overdueText}>
                       {t('finance.history.overdue', {
-                        amount: fmtMoney(
-                          parentHistory?.summary?.totalOverdue
-                        ),
+                        amount: fmtMoney(parentHistory?.summary?.totalOverdue),
                         months: parentHistory?.summary?.overdueMonths,
                       })}
                     </Text>
@@ -2924,10 +3986,7 @@ export const FinancialManagementScreen: React.FC = () => {
                               ]}
                             >
                               <Text
-                                style={[
-                                  styles.statusText,
-                                  { color: sc.text },
-                                ]}
+                                style={[styles.statusText, { color: sc.text }]}
                               >
                                 {t(
                                   `finance.paymentStatus.${
@@ -2941,9 +4000,7 @@ export const FinancialManagementScreen: React.FC = () => {
                                 styles.monthRowBalance,
                                 {
                                   color:
-                                    m.balance > 0
-                                      ? COLORS.red
-                                      : COLORS.primary,
+                                    m.balance > 0 ? COLORS.red : COLORS.primary,
                                 },
                               ]}
                             >
@@ -2965,9 +4022,7 @@ export const FinancialManagementScreen: React.FC = () => {
                       .slice(0, 20)
                       .map((p, idx) => {
                         const methodKey =
-                          PAYMENT_METHOD_KEY[
-                            p.paymentMethod as PaymentMethod
-                          ];
+                          PAYMENT_METHOD_KEY[p.paymentMethod as PaymentMethod];
                         const methodLabel = methodKey
                           ? t(`finance.methods.${methodKey}`)
                           : p.paymentMethod || '';
@@ -2993,6 +4048,16 @@ export const FinancialManagementScreen: React.FC = () => {
                             <Text style={styles.paymentAmount}>
                               {fmtMoney(p.amount)}
                             </Text>
+                            <TouchableOpacity
+                              style={styles.iconBtn}
+                              onPress={() => handlePrint('payment', p)}
+                            >
+                              <Ionicons
+                                name="print-outline"
+                                size={16}
+                                color={COLORS.purple}
+                              />
+                            </TouchableOpacity>
                             <TouchableOpacity
                               style={styles.iconBtn}
                               onPress={() => handleDeleteHistoryPayment(p)}
@@ -3051,10 +4116,7 @@ export const FinancialManagementScreen: React.FC = () => {
               {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
                 <TouchableOpacity
                   key={m}
-                  style={[
-                    styles.chip,
-                    generateMonth === m && styles.chipActive,
-                  ]}
+                  style={[styles.chip, generateMonth === m && styles.chipActive]}
                   onPress={() => setGenerateMonth(m)}
                 >
                   <Text
@@ -3077,25 +4139,24 @@ export const FinancialManagementScreen: React.FC = () => {
               showsHorizontalScrollIndicator={false}
               contentContainerStyle={styles.chipScroll}
             >
-              {Array.from(
-                { length: 3 },
-                (_, i) => now.getFullYear() - 2 + i
-              ).map((y) => (
-                <TouchableOpacity
-                  key={y}
-                  style={[styles.chip, generateYear === y && styles.chipActive]}
-                  onPress={() => setGenerateYear(y)}
-                >
-                  <Text
-                    style={[
-                      styles.chipText,
-                      generateYear === y && styles.chipTextActive,
-                    ]}
+              {Array.from({ length: 3 }, (_, i) => now.getFullYear() - 2 + i).map(
+                (y) => (
+                  <TouchableOpacity
+                    key={y}
+                    style={[styles.chip, generateYear === y && styles.chipActive]}
+                    onPress={() => setGenerateYear(y)}
                   >
-                    {y}
-                  </Text>
-                </TouchableOpacity>
-              ))}
+                    <Text
+                      style={[
+                        styles.chipText,
+                        generateYear === y && styles.chipTextActive,
+                      ]}
+                    >
+                      {y}
+                    </Text>
+                  </TouchableOpacity>
+                )
+              )}
             </ScrollView>
 
             <View style={styles.infoBox}>
@@ -3266,17 +4327,12 @@ export const FinancialManagementScreen: React.FC = () => {
           <ScrollView style={styles.modalBody}>
             <View style={styles.reportGrid}>
               <View
-                style={[
-                  styles.reportTile,
-                  { backgroundColor: COLORS.primaryLight },
-                ]}
+                style={[styles.reportTile, { backgroundColor: COLORS.primaryLight }]}
               >
                 <Text style={styles.reportLabel}>
                   {t('finance.reportModal.revenue')}
                 </Text>
-                <Text
-                  style={[styles.reportValue, { color: COLORS.primary }]}
-                >
+                <Text style={[styles.reportValue, { color: COLORS.primary }]}>
                   {fmtMoney(stats.totalRevenue)}
                 </Text>
               </View>
@@ -3291,10 +4347,7 @@ export const FinancialManagementScreen: React.FC = () => {
                 </Text>
               </View>
               <View
-                style={[
-                  styles.reportTile,
-                  { backgroundColor: COLORS.blueLight },
-                ]}
+                style={[styles.reportTile, { backgroundColor: COLORS.blueLight }]}
               >
                 <Text style={styles.reportLabel}>
                   {t('finance.reportModal.netProfit')}
@@ -3317,17 +4370,6 @@ export const FinancialManagementScreen: React.FC = () => {
                 </Text>
               </View>
             </View>
-
-            <View style={styles.infoBox}>
-              <Ionicons
-                name="information-circle-outline"
-                size={16}
-                color={COLORS.blue}
-              />
-              <Text style={styles.infoBoxText}>
-                {t('finance.reportModal.comingSoon')}
-              </Text>
-            </View>
           </ScrollView>
 
           <View style={styles.modalFooter}>
@@ -3342,6 +4384,434 @@ export const FinancialManagementScreen: React.FC = () => {
           </View>
         </View>
       </View>
+    </Modal>
+  );
+
+  const renderPrintModal = () => (
+    <Modal
+      visible={showPrintModal}
+      transparent
+      animationType="fade"
+      onRequestClose={() => setShowPrintModal(false)}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={[styles.modalContainer, { maxHeight: '40%' }]}>
+          <View style={styles.modalHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.modalTitle}>
+                {printType === 'payment'
+                  ? t('finance.printModal.paymentTitle') || 'Payment Receipt'
+                  : printType === 'history'
+                  ? t('finance.printModal.ledgerTitle') || 'Student Ledger'
+                  : t('finance.printModal.payrollTitle') || 'Payroll Invoice'}
+              </Text>
+              <Text style={styles.modalSubtitle}>
+                {t('finance.printModal.subtitle') || 'Choose an action'}
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={styles.modalCloseBtn}
+              onPress={() => setShowPrintModal(false)}
+            >
+              <Ionicons name="close" size={22} color={COLORS.slate} />
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.modalFooter}>
+            <TouchableOpacity
+              style={[styles.cancelBtn, { flex: 1 }]}
+              onPress={() => setShowPrintModal(false)}
+            >
+              <Text style={styles.cancelBtnText}>{t('finance.cancel')}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.saveBtn,
+                { flex: 1, backgroundColor: COLORS.white, borderWidth: 1.5, borderColor: COLORS.blue },
+              ]}
+              onPress={handleShareNow}
+            >
+              <Ionicons name="share-outline" size={18} color={COLORS.blue} />
+              <Text style={[styles.saveBtnText, { color: COLORS.blue }]}>
+                {t('finance.printModal.share') || 'Share PDF'}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[styles.saveBtn, { flex: 1.2 }]}
+              onPress={handlePrintNow}
+            >
+              <Ionicons name="print" size={18} color={COLORS.white} />
+              <Text style={styles.saveBtnText}>
+                {t('finance.printModal.print') || 'Print'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+
+  const renderInvoiceModal = () => (
+    <Modal
+      visible={showInvoiceModal}
+      transparent
+      animationType="slide"
+      onRequestClose={() => setShowInvoiceModal(false)}
+    >
+      <KeyboardAvoidingView
+        style={styles.modalOverlay}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <View style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.modalTitle}>
+                {t('finance.invoiceModal.title')}
+              </Text>
+              <Text style={styles.modalSubtitle}>
+                {t('finance.invoiceModal.subtitle')}
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={styles.modalCloseBtn}
+              onPress={() => setShowInvoiceModal(false)}
+            >
+              <Ionicons name="close" size={22} color={COLORS.slate} />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            style={styles.modalBody}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.formLabel}>
+              {t('finance.invoiceModal.schoolLogo')}
+            </Text>
+            <View style={styles.logoRow}>
+              <View style={styles.logoBox}>
+                {invoicePreview ? (
+                  <Image
+                    source={{ uri: invoicePreview }}
+                    style={styles.logoImg}
+                    resizeMode="contain"
+                  />
+                ) : (
+                  <Ionicons name="image-outline" size={28} color={COLORS.gray} />
+                )}
+              </View>
+              <View style={{ flex: 1, gap: 6 }}>
+                <TouchableOpacity style={styles.primarySmBtn} onPress={pickLogo}>
+                  <Ionicons name="cloud-upload-outline" size={14} color="#fff" />
+                  <Text style={styles.primarySmBtnText}>
+                    {invoicePreview
+                      ? t('finance.invoiceModal.changeLogo')
+                      : t('finance.invoiceModal.uploadLogo')}
+                  </Text>
+                </TouchableOpacity>
+                {invoicePreview ? (
+                  <TouchableOpacity
+                    style={styles.dangerSmBtn}
+                    onPress={removeLogo}
+                  >
+                    <Ionicons name="trash-outline" size={14} color={COLORS.red} />
+                    <Text style={styles.dangerSmBtnText}>
+                      {t('finance.invoiceModal.remove')}
+                    </Text>
+                  </TouchableOpacity>
+                ) : null}
+              </View>
+            </View>
+
+            <Text style={styles.formLabel}>
+              {t('finance.invoiceModal.schoolName')}
+            </Text>
+            <TextInput
+              style={styles.formInput}
+              value={invoiceSettings.schoolName}
+              onChangeText={(v) =>
+                setInvoiceSettings((prev) => ({ ...prev, schoolName: v }))
+              }
+              placeholder="Al-Irshaad Institute"
+              placeholderTextColor="#A0AAA5"
+            />
+
+            <Text style={styles.formLabel}>
+              {t('finance.invoiceModal.phone')}
+            </Text>
+            <TextInput
+              style={styles.formInput}
+              value={invoiceSettings.phone}
+              onChangeText={(v) =>
+                setInvoiceSettings((prev) => ({ ...prev, phone: v }))
+              }
+              placeholder="+252 61X XXX XXX"
+              placeholderTextColor="#A0AAA5"
+              keyboardType="phone-pad"
+            />
+
+            <Text style={styles.formLabel}>
+              {t('finance.invoiceModal.email')}
+            </Text>
+            <TextInput
+              style={styles.formInput}
+              value={invoiceSettings.email}
+              onChangeText={(v) =>
+                setInvoiceSettings((prev) => ({ ...prev, email: v }))
+              }
+              placeholder="info@example.com"
+              placeholderTextColor="#A0AAA5"
+              keyboardType="email-address"
+              autoCapitalize="none"
+            />
+
+            <Text style={styles.formLabel}>
+              {t('finance.invoiceModal.address')}
+            </Text>
+            <TextInput
+              style={styles.formInput}
+              value={invoiceSettings.address}
+              onChangeText={(v) =>
+                setInvoiceSettings((prev) => ({ ...prev, address: v }))
+              }
+              placeholder="Mogadishu, Somalia"
+              placeholderTextColor="#A0AAA5"
+            />
+
+            <Text style={styles.formLabel}>
+              {t('finance.invoiceModal.footer')}
+            </Text>
+            <TextInput
+              style={styles.formInput}
+              value={invoiceSettings.footer}
+              onChangeText={(v) =>
+                setInvoiceSettings((prev) => ({ ...prev, footer: v }))
+              }
+              placeholder="Thank you for your payment"
+              placeholderTextColor="#A0AAA5"
+            />
+
+            <View style={{ height: 20 }} />
+          </ScrollView>
+
+          <View style={styles.modalFooter}>
+            <TouchableOpacity
+              style={styles.cancelBtn}
+              onPress={() => setShowInvoiceModal(false)}
+            >
+              <Text style={styles.cancelBtnText}>{t('finance.cancel')}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.saveBtn}
+              onPress={handleSaveInvoiceSettings}
+            >
+              <Ionicons name="checkmark" size={18} color={COLORS.white} />
+              <Text style={styles.saveBtnText}>
+                {t('finance.invoiceModal.save')}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
+  );
+
+  const renderCategoriesModal = () => (
+    <Modal
+      visible={showCategoriesModal}
+      transparent
+      animationType="slide"
+      onRequestClose={() => !saving && setShowCategoriesModal(false)}
+    >
+      <KeyboardAvoidingView
+        style={styles.modalOverlay}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <View style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.modalTitle}>
+                {editingCategory
+                  ? t('finance.categories.editTitle')
+                  : t('finance.categories.addTitle')}
+              </Text>
+              <Text style={styles.modalSubtitle}>
+                {t('finance.categories.subtitle')}
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={styles.modalCloseBtn}
+              onPress={() => !saving && setShowCategoriesModal(false)}
+            >
+              <Ionicons name="close" size={22} color={COLORS.slate} />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            style={styles.modalBody}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.formLabel}>
+              {t('finance.categories.name')} *
+            </Text>
+            <TextInput
+              style={styles.formInput}
+              value={categoryForm.name}
+              onChangeText={(v) =>
+                setCategoryForm((prev) => ({ ...prev, name: v }))
+              }
+              placeholder={t('finance.categories.namePlaceholder')}
+              placeholderTextColor="#A0AAA5"
+            />
+
+            <Text style={styles.formLabel}>
+              {t('finance.categories.color')}
+            </Text>
+            <View style={styles.colorRow}>
+              {CATEGORY_COLOR_PALETTE.map((c) => {
+                const active = categoryForm.color === c;
+                return (
+                  <TouchableOpacity
+                    key={c}
+                    style={[
+                      styles.colorSwatch,
+                      { backgroundColor: c },
+                      active && styles.colorSwatchActive,
+                    ]}
+                    onPress={() =>
+                      setCategoryForm((prev) => ({ ...prev, color: c }))
+                    }
+                  >
+                    {active && (
+                      <Ionicons name="checkmark" size={14} color="#fff" />
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <View style={styles.categoriesMembersHeader}>
+              <Text style={styles.formLabel}>
+                {t('finance.categories.selectParents')} (
+                {categoryForm.parentIds.length})
+              </Text>
+              <View style={{ flexDirection: 'row', gap: 6 }}>
+                <TouchableOpacity
+                  style={styles.miniBtn}
+                  onPress={() =>
+                    setCategoryForm((prev) => ({
+                      ...prev,
+                      parentIds: parents.map((p) => p._id),
+                    }))
+                  }
+                >
+                  <Text style={styles.miniBtnText}>
+                    {t('finance.categories.selectAll')}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.miniBtn}
+                  onPress={() =>
+                    setCategoryForm((prev) => ({ ...prev, parentIds: [] }))
+                  }
+                >
+                  <Text style={styles.miniBtnText}>
+                    {t('finance.categories.clear')}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <View style={styles.searchWrapper}>
+              <Ionicons name="search-outline" size={18} color={COLORS.gray} />
+              <TextInput
+                style={styles.searchInput}
+                placeholder={t('finance.categories.searchParents')}
+                placeholderTextColor="#A0AAA5"
+                value={categoryForm.parentSearch}
+                onChangeText={(v) =>
+                  setCategoryForm((prev) => ({ ...prev, parentSearch: v }))
+                }
+              />
+              {categoryForm.parentSearch.length > 0 && (
+                <TouchableOpacity
+                  onPress={() =>
+                    setCategoryForm((prev) => ({ ...prev, parentSearch: '' }))
+                  }
+                >
+                  <Ionicons name="close-circle" size={18} color={COLORS.gray} />
+                </TouchableOpacity>
+              )}
+            </View>
+
+            <View style={styles.categoryParentsList}>
+              {categoryParentSuggestions.length === 0 ? (
+                <Text style={styles.emptyText}>
+                  {t('finance.categories.noParents')}
+                </Text>
+              ) : (
+                categoryParentSuggestions.map((p) => {
+                  const checked = categoryForm.parentIds.includes(p._id);
+                  return (
+                    <TouchableOpacity
+                      key={p._id}
+                      style={styles.checkboxRow}
+                      onPress={() => toggleCategoryParent(p._id)}
+                    >
+                      <Ionicons
+                        name={checked ? 'checkbox' : 'square-outline'}
+                        size={20}
+                        color={checked ? COLORS.primary : COLORS.slateMuted}
+                      />
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.checkboxName}>{p.name}</Text>
+                        {p.phone ? (
+                          <Text style={styles.checkboxMeta}>{p.phone}</Text>
+                        ) : null}
+                      </View>
+                    </TouchableOpacity>
+                  );
+                })
+              )}
+            </View>
+
+            <View style={{ height: 20 }} />
+          </ScrollView>
+
+          <View style={styles.modalFooter}>
+            <TouchableOpacity
+              style={styles.cancelBtn}
+              onPress={() => !saving && setShowCategoriesModal(false)}
+              disabled={saving}
+            >
+              <Text style={styles.cancelBtnText}>{t('finance.cancel')}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[
+                styles.saveBtn,
+                { backgroundColor: COLORS.teal },
+                saving && { opacity: 0.7 },
+              ]}
+              onPress={handleSaveCategory}
+              disabled={saving}
+            >
+              {saving ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <>
+                  <Ionicons name="checkmark" size={18} color="#fff" />
+                  <Text style={styles.saveBtnText}>
+                    {editingCategory
+                      ? t('finance.categories.update')
+                      : t('finance.categories.create')}
+                  </Text>
+                </>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
     </Modal>
   );
 
@@ -3374,9 +4844,7 @@ export const FinancialManagementScreen: React.FC = () => {
             <Ionicons
               name={tab.icon}
               size={14}
-              color={
-                activeTab === tab.key ? COLORS.white : COLORS.slateMuted
-              }
+              color={activeTab === tab.key ? COLORS.white : COLORS.slateMuted}
             />
             <Text
               style={[
@@ -3424,6 +4892,9 @@ export const FinancialManagementScreen: React.FC = () => {
       {renderGenerateModal()}
       {renderCancelModal()}
       {renderReportModal()}
+      {renderPrintModal()}
+      {renderInvoiceModal()}
+      {renderCategoriesModal()}
     </SafeAreaView>
   );
 };
@@ -3435,7 +4906,6 @@ export default FinancialManagementScreen;
 // ============================================================
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
-
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -3446,7 +4916,7 @@ const styles = StyleSheet.create({
   },
   headerTitle: { fontSize: 24, fontWeight: '800', color: COLORS.slate },
   headerSubtitle: { fontSize: 12, color: COLORS.slateMuted, marginTop: 2 },
-  headerActions: { flexDirection: 'row', gap: 10 },
+  headerActions: { flexDirection: 'row', gap: 8 },
   headerIconBtn: {
     width: 42,
     height: 42,
@@ -3454,7 +4924,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-
   tabsRow: {
     flexDirection: 'row',
     paddingHorizontal: 16,
@@ -3477,7 +4946,6 @@ const styles = StyleSheet.create({
   tabActive: { backgroundColor: COLORS.primary, borderColor: COLORS.primary },
   tabText: { fontSize: 10, fontWeight: '700', color: COLORS.slateMuted },
   tabTextActive: { color: COLORS.white },
-
   errorBanner: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -3503,160 +4971,303 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#BFE9D4',
   },
-  successText: { flex: 1, fontSize: 12, color: COLORS.primary, fontWeight: '600' },
-
+  successText: {
+    flex: 1,
+    fontSize: 12,
+    color: COLORS.primary,
+    fontWeight: '600',
+  },
   tabContent: { paddingHorizontal: 16, paddingBottom: 24 },
-
-  statsGrid: { flexDirection: 'row', flexWrap: 'wrap', marginHorizontal: -4, marginBottom: 12 },
+  statsGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginHorizontal: -4,
+    marginBottom: 12,
+  },
   statTile: { width: '50%', paddingHorizontal: 4, marginBottom: 8 },
   statIcon: {
-    width: 36, height: 36, borderRadius: 10,
-    alignItems: 'center', justifyContent: 'center', marginBottom: 8,
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
   },
   statLabel: { fontSize: 11, color: COLORS.slateMuted, fontWeight: '600' },
   statValue: { fontSize: 18, fontWeight: '800', marginTop: 2 },
-
   outstandingCard: {
-    flexDirection: 'row', alignItems: 'center', gap: 12,
-    backgroundColor: COLORS.white, borderRadius: 14, padding: 16,
-    borderWidth: 1, borderColor: COLORS.border, marginBottom: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: COLORS.white,
+    borderRadius: 14,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    marginBottom: 16,
   },
   outstandingIcon: {
-    width: 48, height: 48, borderRadius: 24,
-    alignItems: 'center', justifyContent: 'center',
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   outstandingLabel: { fontSize: 12, color: COLORS.slateMuted, fontWeight: '600' },
-  outstandingValue: { fontSize: 20, fontWeight: '800', color: COLORS.amber, marginTop: 2 },
+  outstandingValue: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: COLORS.amber,
+    marginTop: 2,
+  },
   outstandingMeta: { fontSize: 11, color: COLORS.gray, marginTop: 4 },
-
   section: { marginTop: 8, marginBottom: 8 },
-  sectionTitle: { fontSize: 14, fontWeight: '800', color: COLORS.slate, marginBottom: 10 },
-
+  sectionTitle: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: COLORS.slate,
+    marginBottom: 10,
+  },
   miniGrid: { flexDirection: 'row', gap: 8 },
   miniCard: {
-    flex: 1, backgroundColor: COLORS.white, borderRadius: 12, padding: 12,
-    borderWidth: 1, borderColor: COLORS.border,
+    flex: 1,
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
   miniLabel: { fontSize: 10, color: COLORS.slateMuted, fontWeight: '700' },
   miniValue: { fontSize: 14, fontWeight: '800', marginTop: 4 },
-
-  breakdownRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 },
-  breakdownLabel: { width: 100, fontSize: 12, color: COLORS.slate, fontWeight: '600' },
+  trendRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 8 },
+  trendMonth: {
+    width: 40,
+    fontSize: 11,
+    color: COLORS.slate,
+    fontWeight: '600',
+  },
+  trendBarWrap: {
+    flex: 1,
+    height: 8,
+    backgroundColor: '#F1F5F9',
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  trendBarRev: { height: '100%', backgroundColor: COLORS.primary, borderRadius: 4 },
+  trendBarExp: { height: '100%', backgroundColor: COLORS.red, borderRadius: 4 },
+  trendAmount: {
+    width: 60,
+    fontSize: 11,
+    textAlign: 'right',
+    fontWeight: '700',
+    color: COLORS.slate,
+  },
+  legend: { flexDirection: 'row', gap: 16, marginTop: 6 },
+  legendDot: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  dotSquare: { width: 10, height: 10, borderRadius: 2 },
+  legendText: { fontSize: 11, color: COLORS.slateMuted },
+  breakdownRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 8,
+  },
+  breakdownLabel: {
+    width: 100,
+    fontSize: 12,
+    color: COLORS.slate,
+    fontWeight: '600',
+  },
   breakdownBarWrap: {
-    flex: 1, height: 8, backgroundColor: '#F1F5F9', borderRadius: 4, overflow: 'hidden',
+    flex: 1,
+    height: 8,
+    backgroundColor: '#F1F5F9',
+    borderRadius: 4,
+    overflow: 'hidden',
   },
   breakdownBar: { height: '100%', backgroundColor: COLORS.red, borderRadius: 4 },
-  breakdownValue: { width: 70, fontSize: 12, textAlign: 'right', fontWeight: '700', color: COLORS.slate },
-
+  breakdownValue: {
+    width: 70,
+    fontSize: 12,
+    textAlign: 'right',
+    fontWeight: '700',
+    color: COLORS.slate,
+  },
   recentItem: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.white,
-    borderRadius: 12, padding: 12, marginBottom: 8,
-    borderWidth: 1, borderColor: COLORS.border, gap: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    gap: 10,
   },
   recentAvatar: {
-    width: 38, height: 38, borderRadius: 19,
-    backgroundColor: COLORS.primaryLight, alignItems: 'center', justifyContent: 'center',
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: COLORS.primaryLight,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   recentAvatarText: { fontSize: 14, fontWeight: '800', color: COLORS.primary },
   recentName: { fontSize: 13, fontWeight: '700', color: COLORS.slate },
   recentMeta: { fontSize: 11, color: COLORS.slateMuted, marginTop: 2 },
   recentAmount: { fontSize: 14, fontWeight: '800', color: COLORS.primary },
-
   reportButton: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8,
-    marginTop: 16, paddingVertical: 14, backgroundColor: COLORS.white,
-    borderRadius: 12, borderWidth: 1.5, borderColor: COLORS.primary,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    marginTop: 16,
+    paddingVertical: 14,
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: COLORS.primary,
   },
   reportButtonText: { fontSize: 13, fontWeight: '700', color: COLORS.primary },
-
   searchRow: { paddingHorizontal: 16, paddingBottom: 8 },
   searchWrapper: {
-    flexDirection: 'row', alignItems: 'center', backgroundColor: COLORS.white,
-    borderRadius: 12, paddingHorizontal: 12,
-    borderWidth: 1, borderColor: COLORS.border, height: 44, gap: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: COLORS.white,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    height: 44,
+    gap: 8,
   },
   searchInput: { flex: 1, fontSize: 14, color: COLORS.slate },
-
   filterBlock: { paddingHorizontal: 16, gap: 6, marginBottom: 6 },
   chipScroll: { gap: 6, paddingVertical: 4, paddingRight: 12 },
   chip: {
-    paddingHorizontal: 12, paddingVertical: 7, borderRadius: 18,
-    backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.border,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 18,
+    backgroundColor: COLORS.white,
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
   chipActive: { backgroundColor: COLORS.primary, borderColor: COLORS.primary },
   chipText: { fontSize: 12, fontWeight: '700', color: COLORS.slateMuted },
   chipTextActive: { color: COLORS.white },
-
   filterRow: { paddingHorizontal: 16, paddingBottom: 8, gap: 8 },
   filterChip: {
-    paddingHorizontal: 14, paddingVertical: 7, borderRadius: 20,
-    backgroundColor: COLORS.white, borderWidth: 1, borderColor: COLORS.border,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 20,
+    backgroundColor: COLORS.white,
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
-  filterChipActive: { backgroundColor: COLORS.primaryLight, borderColor: COLORS.primary },
+  filterChipActive: {
+    backgroundColor: COLORS.primaryLight,
+    borderColor: COLORS.primary,
+  },
   filterChipText: { fontSize: 12, fontWeight: '700', color: COLORS.slateMuted },
   filterChipTextActive: { color: COLORS.primary },
-
   actionRow: { flexDirection: 'row', gap: 8, paddingHorizontal: 16, paddingBottom: 8 },
   smallActionBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 6,
-    paddingHorizontal: 12, paddingVertical: 8, borderRadius: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
   },
   smallActionText: { color: COLORS.white, fontSize: 12, fontWeight: '700' },
-
   listContent: { paddingHorizontal: 16, paddingBottom: 24 },
-
   loadingWrap: { alignItems: 'center', paddingVertical: 40 },
   loadingText: { marginTop: 10, color: COLORS.slateMuted, fontSize: 13 },
-
   parentCard: {
-    backgroundColor: COLORS.white, borderRadius: 14, padding: 14, marginBottom: 10,
-    borderWidth: 1, borderColor: COLORS.border,
+    backgroundColor: COLORS.white,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
   parentRow: { flexDirection: 'row', alignItems: 'center' },
   parentAvatar: {
-    width: 46, height: 46, borderRadius: 23, backgroundColor: COLORS.blueLight,
-    alignItems: 'center', justifyContent: 'center', marginRight: 12,
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: COLORS.blueLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
   },
   parentAvatarText: { fontSize: 16, fontWeight: '800', color: COLORS.blue },
   parentName: { fontSize: 14, fontWeight: '700', color: COLORS.slate },
   parentPhone: { fontSize: 11, color: COLORS.slateMuted, marginTop: 2 },
-  parentChildren: { fontSize: 11, color: COLORS.blue, marginTop: 4, fontWeight: '600' },
+  parentChildren: {
+    fontSize: 11,
+    color: COLORS.blue,
+    marginTop: 4,
+    fontWeight: '600',
+  },
   parentRight: { alignItems: 'flex-end' },
   statusBadge: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
   statusText: { fontSize: 10, fontWeight: '800' },
   balanceLabel: { fontSize: 10, color: COLORS.slateMuted, marginTop: 6 },
   balanceValue: { fontSize: 14, fontWeight: '800' },
   parentActionRow: {
-    flexDirection: 'row', gap: 8, marginTop: 10, paddingTop: 10,
-    borderTopWidth: 1, borderTopColor: COLORS.border,
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.border,
+    flexWrap: 'wrap',
   },
   parentActionBtn: {
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8,
-    borderWidth: 1, borderColor: COLORS.primary,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: COLORS.primary,
   },
   parentActionText: { fontSize: 11, fontWeight: '700', color: COLORS.primary },
-
   summaryBar: {
-    flexDirection: 'row', justifyContent: 'space-around',
-    paddingVertical: 8, paddingHorizontal: 16, backgroundColor: COLORS.white,
-    borderTopWidth: 1, borderTopColor: COLORS.border,
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    backgroundColor: COLORS.white,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.border,
   },
   summaryBarText: { fontSize: 12, fontWeight: '700' },
-
   expenseCard: {
-    backgroundColor: COLORS.white, borderRadius: 14, padding: 14, marginBottom: 10,
-    borderWidth: 1, borderColor: COLORS.border,
+    backgroundColor: COLORS.white,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
   expenseRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   expenseIcon: {
-    width: 44, height: 44, borderRadius: 22, alignItems: 'center', justifyContent: 'center',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   expenseDescription: { fontSize: 13, fontWeight: '700', color: COLORS.slate },
   expenseMeta: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 },
   expenseCategoryTag: {
-    backgroundColor: COLORS.purpleLight, paddingHorizontal: 8,
-    paddingVertical: 2, borderRadius: 6,
+    backgroundColor: COLORS.purpleLight,
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 6,
   },
   expenseCategoryText: { fontSize: 10, fontWeight: '700', color: COLORS.purple },
   expenseDate: { fontSize: 11, color: COLORS.slateMuted },
@@ -3665,153 +5276,485 @@ const styles = StyleSheet.create({
   expenseAmount: { fontSize: 15, fontWeight: '800', color: COLORS.red },
   rowActions: { flexDirection: 'row', gap: 4, marginTop: 6 },
   iconBtn: {
-    width: 28, height: 28, borderRadius: 8,
-    alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.background,
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.background,
   },
-
   payrollCard: {
-    backgroundColor: COLORS.white, borderRadius: 14, padding: 14, marginBottom: 10,
-    borderWidth: 1, borderColor: COLORS.border,
+    backgroundColor: COLORS.white,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
   payrollRow: { flexDirection: 'row', alignItems: 'center' },
   payrollAvatar: {
-    width: 46, height: 46, borderRadius: 23,
-    alignItems: 'center', justifyContent: 'center', marginRight: 12,
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
   },
   payrollAvatarText: { fontSize: 16, fontWeight: '800' },
   payrollName: { fontSize: 14, fontWeight: '700', color: COLORS.slate },
   payrollRole: { fontSize: 11, color: COLORS.slateMuted, marginTop: 2 },
-  payrollPeriod: { fontSize: 11, color: COLORS.purple, marginTop: 4, fontWeight: '600' },
+  payrollPeriod: {
+    fontSize: 11,
+    color: COLORS.purple,
+    marginTop: 4,
+    fontWeight: '600',
+  },
   payrollRight: { alignItems: 'flex-end' },
-  payrollAmount: { fontSize: 15, fontWeight: '800', color: COLORS.purple, marginTop: 6 },
+  payrollAmount: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: COLORS.purple,
+    marginTop: 6,
+  },
   payrollBase: { fontSize: 10, color: COLORS.slateMuted },
-
   emptyContainer: {
-    alignItems: 'center', justifyContent: 'center',
-    paddingVertical: 50, paddingHorizontal: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 50,
+    paddingHorizontal: 32,
   },
-  emptyTitle: { fontSize: 16, fontWeight: '700', color: COLORS.slate, marginTop: 14 },
+  emptyTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: COLORS.slate,
+    marginTop: 14,
+  },
   emptyText: {
-    fontSize: 13, color: COLORS.slateMuted, textAlign: 'center',
-    marginTop: 8, lineHeight: 20,
+    fontSize: 13,
+    color: COLORS.slateMuted,
+    textAlign: 'center',
+    marginTop: 8,
+    lineHeight: 20,
   },
-
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'flex-end',
+  },
   modalContainer: {
-    backgroundColor: COLORS.white, borderTopLeftRadius: 24,
-    borderTopRightRadius: 24, maxHeight: '92%',
+    backgroundColor: COLORS.white,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    maxHeight: '92%',
   },
   modalHeader: {
-    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
-    padding: 20, borderBottomWidth: 1, borderBottomColor: COLORS.border,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.border,
+    gap: 8,
   },
   modalTitle: { fontSize: 18, fontWeight: '800', color: COLORS.slate },
   modalSubtitle: { fontSize: 12, color: COLORS.slateMuted, marginTop: 2 },
   modalCloseBtn: {
-    width: 34, height: 34, borderRadius: 17, backgroundColor: COLORS.background,
-    alignItems: 'center', justifyContent: 'center',
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: COLORS.background,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   modalBody: { paddingHorizontal: 20, paddingTop: 8 },
-
   formLabel: {
-    fontSize: 11, fontWeight: '800', color: COLORS.slateMuted,
-    marginTop: 14, marginBottom: 6, textTransform: 'uppercase', letterSpacing: 0.3,
+    fontSize: 11,
+    fontWeight: '800',
+    color: COLORS.slateMuted,
+    marginTop: 14,
+    marginBottom: 6,
+    textTransform: 'uppercase',
+    letterSpacing: 0.3,
   },
   formInput: {
-    borderWidth: 1, borderColor: COLORS.border, borderRadius: 10,
-    paddingHorizontal: 12, paddingVertical: 10, fontSize: 14, color: COLORS.slate,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    color: COLORS.slate,
     backgroundColor: COLORS.white,
   },
   textArea: { minHeight: 60, textAlignVertical: 'top' },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 4 },
-
   dropdown: {
-    backgroundColor: COLORS.white, borderRadius: 10, borderWidth: 1,
-    borderColor: COLORS.border, marginTop: 4, overflow: 'hidden',
+    backgroundColor: COLORS.white,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    marginTop: 4,
+    overflow: 'hidden',
   },
   dropdownItem: {
-    paddingHorizontal: 14, paddingVertical: 10,
-    borderBottomWidth: 1, borderBottomColor: '#F1F5F9',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
   },
   dropdownName: { fontSize: 13, fontWeight: '700', color: COLORS.slate },
   dropdownMeta: { fontSize: 11, color: COLORS.slateMuted, marginTop: 2 },
-
   checkboxRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10,
-    borderBottomWidth: 1, borderBottomColor: '#F1F5F9',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
   },
   checkboxName: { fontSize: 13, fontWeight: '700', color: COLORS.slate },
   checkboxMeta: { fontSize: 11, color: COLORS.slateMuted, marginTop: 2 },
-
-  infoCard: { backgroundColor: COLORS.purpleLight, borderRadius: 10, padding: 12, marginTop: 8 },
+  infoCard: {
+    backgroundColor: COLORS.purpleLight,
+    borderRadius: 10,
+    padding: 12,
+    marginTop: 8,
+  },
   infoCardName: { fontSize: 14, fontWeight: '800', color: COLORS.purple },
   infoCardMeta: { fontSize: 12, color: COLORS.slate, marginTop: 2 },
-
   infoBox: {
-    flexDirection: 'row', alignItems: 'flex-start', gap: 8,
-    backgroundColor: COLORS.blueLight, borderRadius: 10, padding: 12, marginTop: 12,
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+    backgroundColor: COLORS.blueLight,
+    borderRadius: 10,
+    padding: 12,
+    marginTop: 12,
   },
-  infoBoxText: { flex: 1, fontSize: 12, color: COLORS.blue, fontWeight: '600' },
-
-  historyGrid: { flexDirection: 'row', flexWrap: 'wrap', marginHorizontal: -4, marginBottom: 8 },
+  infoBoxText: {
+    flex: 1,
+    fontSize: 12,
+    color: COLORS.blue,
+    fontWeight: '600',
+  },
+  historyGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginHorizontal: -4,
+    marginBottom: 8,
+  },
   historyTile: {
-    width: '50%', paddingHorizontal: 4, marginBottom: 8, borderRadius: 12, padding: 12,
+    width: '50%',
+    paddingHorizontal: 4,
+    marginBottom: 8,
+    borderRadius: 12,
+    padding: 12,
   },
   historyLabel: {
-    fontSize: 10, color: COLORS.slateMuted, fontWeight: '800', textTransform: 'uppercase',
+    fontSize: 10,
+    color: COLORS.slateMuted,
+    fontWeight: '800',
+    textTransform: 'uppercase',
   },
   historyValue: { fontSize: 16, fontWeight: '800', marginTop: 4 },
-
   overdueBanner: {
-    flexDirection: 'row', alignItems: 'center', gap: 8,
-    backgroundColor: COLORS.redLight, borderRadius: 10, padding: 10, marginBottom: 8,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    backgroundColor: COLORS.redLight,
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
   },
   overdueText: { flex: 1, fontSize: 12, color: COLORS.red, fontWeight: '600' },
-
   monthRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10,
-    borderBottomWidth: 1, borderBottomColor: '#F1F5F9',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
   },
   monthRowTitle: { fontSize: 13, fontWeight: '700', color: COLORS.slate },
   monthRowMeta: { fontSize: 11, color: COLORS.slateMuted, marginTop: 2 },
   monthRowBalance: { fontSize: 13, fontWeight: '800', marginLeft: 4 },
-
   paymentRow: {
-    flexDirection: 'row', alignItems: 'center', gap: 8, paddingVertical: 10,
-    borderBottomWidth: 1, borderBottomColor: '#F1F5F9',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F5F9',
   },
   paymentStudent: { fontSize: 13, fontWeight: '700', color: COLORS.slate },
   paymentMeta: { fontSize: 11, color: COLORS.slateMuted, marginTop: 2 },
   paymentAmount: { fontSize: 13, fontWeight: '800', color: COLORS.primary },
-
   monthOption: {
-    paddingVertical: 12, paddingHorizontal: 14, borderRadius: 10,
-    backgroundColor: COLORS.background, borderWidth: 1, borderColor: COLORS.border,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
     marginBottom: 6,
   },
-  monthOptionActive: { backgroundColor: COLORS.primaryLight, borderColor: COLORS.primary },
+  monthOptionActive: {
+    backgroundColor: COLORS.primaryLight,
+    borderColor: COLORS.primary,
+  },
   monthOptionText: { fontSize: 13, fontWeight: '700', color: COLORS.slate },
   monthOptionTextActive: { color: COLORS.primary },
-
-  reportGrid: { flexDirection: 'row', flexWrap: 'wrap', marginHorizontal: -4, marginBottom: 8 },
+  reportGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    marginHorizontal: -4,
+    marginBottom: 8,
+  },
   reportTile: {
-    width: '50%', paddingHorizontal: 4, marginBottom: 8, borderRadius: 12, padding: 12,
+    width: '50%',
+    paddingHorizontal: 4,
+    marginBottom: 8,
+    borderRadius: 12,
+    padding: 12,
   },
   reportLabel: { fontSize: 10, color: COLORS.slateMuted, fontWeight: '800' },
   reportValue: { fontSize: 16, fontWeight: '800', marginTop: 4 },
-
   modalFooter: {
-    flexDirection: 'row', padding: 20, gap: 10,
-    borderTopWidth: 1, borderTopColor: COLORS.border,
+    flexDirection: 'row',
+    padding: 20,
+    gap: 10,
+    borderTopWidth: 1,
+    borderTopColor: COLORS.border,
+    flexWrap: 'wrap',
   },
   cancelBtn: {
-    flex: 1, paddingVertical: 12, borderRadius: 12, backgroundColor: COLORS.background,
-    alignItems: 'center', borderWidth: 1, borderColor: COLORS.border,
+    flex: 1,
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: COLORS.background,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
   },
   cancelBtnText: { fontSize: 14, fontWeight: '700', color: COLORS.slate },
   saveBtn: {
-    flex: 2, flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
-    paddingVertical: 12, borderRadius: 12, backgroundColor: COLORS.primary, gap: 6,
+    flex: 2,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: COLORS.primary,
+    gap: 6,
   },
   saveBtnText: { fontSize: 14, fontWeight: '700', color: COLORS.white },
+  logoRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  logoBox: {
+    width: 84,
+    height: 84,
+    borderRadius: 12,
+    backgroundColor: COLORS.white,
+    borderWidth: 2,
+    borderStyle: 'dashed',
+    borderColor: COLORS.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  logoImg: { width: '100%', height: '100%' },
+  primarySmBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: COLORS.primary,
+  },
+  primarySmBtnText: { color: '#fff', fontSize: 12, fontWeight: '700' },
+  dangerSmBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    backgroundColor: COLORS.white,
+    borderWidth: 1,
+    borderColor: COLORS.red,
+  },
+    dangerSmBtnText: { color: COLORS.red, fontSize: 12, fontWeight: '700' },
+
+  // ---- Income categories ----
+  sectionHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  sectionHeaderBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: COLORS.tealLight,
+  },
+  sectionHeaderBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.teal,
+  },
+  categoryCard: {
+    backgroundColor: COLORS.white,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  categoryHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 10,
+  },
+  categoryColorDot: {
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+  },
+  categoryName: {
+    flex: 1,
+    fontSize: 14,
+    fontWeight: '800',
+    color: COLORS.slate,
+  },
+  categoryParents: {
+    fontSize: 11,
+    color: COLORS.slateMuted,
+    fontWeight: '600',
+  },
+  categoryDeleteBtn: {
+    width: 26,
+    height: 26,
+    borderRadius: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: COLORS.redLight,
+  },
+  categoryAmountRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginBottom: 8,
+  },
+  categoryAmountLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: COLORS.slateMuted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.3,
+  },
+  categoryAmount: {
+    fontSize: 16,
+    fontWeight: '800',
+    marginTop: 2,
+  },
+  categoryBarWrap: {
+    height: 6,
+    backgroundColor: '#F1F5F9',
+    borderRadius: 3,
+    overflow: 'hidden',
+  },
+  categoryBar: {
+    height: '100%',
+    borderRadius: 3,
+  },
+  categoryPct: {
+    marginTop: 4,
+    fontSize: 10,
+    color: COLORS.slateMuted,
+    fontWeight: '600',
+  },
+  categoryUncatRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderStyle: 'dashed',
+  },
+  categoryUncatLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.slateMuted,
+  },
+  categoryUncatValue: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: COLORS.slate,
+  },
+
+  // Categories modal
+  colorRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+    marginBottom: 4,
+  },
+  colorSwatch: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: 'transparent',
+  },
+  colorSwatchActive: {
+    borderColor: COLORS.slate,
+  },
+  categoriesMembersHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  miniBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 8,
+    backgroundColor: COLORS.background,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  miniBtnText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: COLORS.slate,
+  },
+  categoryParentsList: {
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+    borderRadius: 10,
+    overflow: 'hidden',
+    maxHeight: 260,
+  },
 });

@@ -22,6 +22,8 @@ import { useNavigation } from '@react-navigation/native';
 import { useAuth } from '../../context/AuthContext';
 import { useBranch } from '../../context/BranchContext';
 import { api as apiClient } from '../../api/client';
+import { enqueue } from '../../utils/offlineDb';
+import { useNetworkStatus } from '../../hooks/useNetworkStatus';
 
 // ============================================================
 // COLORS
@@ -326,6 +328,7 @@ export const TeacherMemorizationScreen: React.FC = () => {
   const navigation = useNavigation<any>();
   const { user } = useAuth();
   const { currentBranch } = useBranch();
+  const { isOnline } = useNetworkStatus();
 
   // Data
   const [teacherHalaqahs, setTeacherHalaqahs] = useState<Halaqah[]>([]);
@@ -386,10 +389,20 @@ export const TeacherMemorizationScreen: React.FC = () => {
   const loadInitial = useCallback(async () => {
     try {
       setError('');
+      const branchId = currentBranch?._id;
+
       const [hRes, typesRes, booksRes]: any = await Promise.all([
         apiClient.get('/teacher/halaqahs'),
         apiClient.get('/teacher/achievement-types').catch(() => null),
-        apiClient.get('/teacher/books').catch(() => null),
+        // Books are created by the admin via POST /books — read from the
+        // same shared endpoint so admin-created books show up here too.
+        apiClient
+          .get('/books', branchId ? { branchId } : undefined)
+          .catch(() =>
+            // Fallback: if the shared endpoint isn't reachable for this
+            // role, try the teacher-scoped endpoint.
+            apiClient.get('/teacher/books').catch(() => null)
+          ),
       ]);
 
       const list: Halaqah[] = Array.isArray(hRes)
@@ -402,7 +415,6 @@ export const TeacherMemorizationScreen: React.FC = () => {
       }
 
       if (typesRes && Array.isArray(typesRes)) {
-        // Merge with defaults so all core types are always available
         const merged = [...typesRes];
         DEFAULT_TYPES.forEach((def) => {
           if (!merged.some((t: any) => t.value === def.value)) {
@@ -414,16 +426,27 @@ export const TeacherMemorizationScreen: React.FC = () => {
         setAchievementTypes(DEFAULT_TYPES);
       }
 
+      // Normalize various response shapes the API might return.
+      const rawBooks = Array.isArray(booksRes)
+        ? booksRes
+        : booksRes?.books || booksRes?.data || [];
       setBooks(
-        Array.isArray(booksRes) ? booksRes : booksRes?.data || []
+        rawBooks.map((b: any) => ({
+          _id: String(b._id || b.id),
+          name: b.name,
+          author: b.author,
+          bookType: b.bookType || 'pages',
+        }))
       );
     } catch (err: any) {
       console.error('Load initial memorization error:', err);
-      setError(err?.message || t('teacher.memorization.alerts.loadHalaqahsFailed'));
+      setError(
+        err?.message || t('teacher.memorization.alerts.loadHalaqahsFailed')
+      );
     } finally {
       setInitialLoading(false);
     }
-  }, [t]);
+  }, [t, currentBranch?._id]); 
 
   useEffect(() => {
     loadInitial();
@@ -643,22 +666,56 @@ export const TeacherMemorizationScreen: React.FC = () => {
         }
       }
 
-      await apiClient.post('/memorizations', data);
-      setAddModal({ visible: false, student: null });
-      if (selectedHalaqah) {
-        const id = selectedHalaqah._id || selectedHalaqah.id || '';
-        await loadStudents(id);
-        await loadTodaysAchievements(id, selectedDate);
+      // -------- OFFLINE PATH --------
+      if (!isOnline) {
+        await enqueue('memorization', branchId, data);
+        setAddModal({ visible: false, student: null });
+        if (selectedHalaqah) {
+          const id = selectedHalaqah._id || selectedHalaqah.id || '';
+          await loadStudents(id);
+          await loadTodaysAchievements(id, selectedDate);
+        }
+        Alert.alert(
+          t('teacher.memorization.actions.save'),
+          'Saved offline — will sync automatically'
+        );
+        return;
       }
-      Alert.alert(
-        t('teacher.memorization.actions.save'),
-        t('teacher.memorization.alerts.saveSuccess')
-      );
-    } catch (err: any) {
-      Alert.alert(
-        t('teacher.memorization.actions.save'),
-        err?.message || t('teacher.memorization.alerts.saveFailed')
-      );
+
+      // -------- ONLINE PATH --------
+      try {
+        await apiClient.post('/memorizations', data);
+        setAddModal({ visible: false, student: null });
+        if (selectedHalaqah) {
+          const id = selectedHalaqah._id || selectedHalaqah.id || '';
+          await loadStudents(id);
+          await loadTodaysAchievements(id, selectedDate);
+        }
+        Alert.alert(
+          t('teacher.memorization.actions.save'),
+          t('teacher.memorization.alerts.saveSuccess')
+        );
+      } catch (err: any) {
+        // Weak signal / timeout / server error → queue silently
+        try {
+          await enqueue('memorization', branchId, data);
+          setAddModal({ visible: false, student: null });
+          if (selectedHalaqah) {
+            const id = selectedHalaqah._id || selectedHalaqah.id || '';
+            await loadStudents(id);
+            await loadTodaysAchievements(id, selectedDate);
+          }
+          Alert.alert(
+            t('teacher.memorization.actions.save'),
+            'Saved offline — will sync automatically'
+          );
+        } catch (e: any) {
+          Alert.alert(
+            t('teacher.memorization.actions.save'),
+            err?.message || t('teacher.memorization.alerts.saveFailed')
+          );
+        }
+      }
     } finally {
       setSaving(false);
     }
@@ -2166,3 +2223,5 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
 });
+
+//const { isOnline } = useNetworkStatus()

@@ -19,6 +19,7 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../../context/AuthContext';
 import { useBranch } from '../../context/BranchContext';
 import { api } from '../../api/client';
+import { hasPermission, PageKey } from '../../utils/permissions';
 
 const { width } = Dimensions.get('window');
 
@@ -85,7 +86,7 @@ const initials = (name?: string) => {
 };
 
 // ============================================================
-// ADMIN PAGES CONFIG (translation keys)
+// ADMIN PAGES CONFIG — now includes `permission` (PageKey)
 // ============================================================
 const ADMIN_PAGES: {
   key: string;
@@ -93,22 +94,23 @@ const ADMIN_PAGES: {
   icon: any;
   iconColor: string;
   background: string;
+  permission: PageKey;
 }[] = [
-  { key: 'Students', labelKey: 'dashboard.pages.students', icon: 'people-outline', iconColor: COLORS.primary, background: COLORS.primaryLight },
-  { key: 'Teachers', labelKey: 'dashboard.pages.teachers', icon: 'school-outline', iconColor: COLORS.blue, background: COLORS.blueLight },
-  { key: 'Parents', labelKey: 'dashboard.pages.parents', icon: 'home-outline', iconColor: COLORS.purple, background: COLORS.purpleLight },
-  { key: 'Employees', labelKey: 'dashboard.pages.employees', icon: 'briefcase-outline', iconColor: COLORS.cyan, background: COLORS.cyanLight },
-  { key: 'Halaqaat', labelKey: 'dashboard.pages.halaqaat', icon: 'book-outline', iconColor: COLORS.gold, background: COLORS.goldLight },
-  { key: 'Attendance', labelKey: 'dashboard.pages.attendance', icon: 'checkmark-circle-outline', iconColor: COLORS.primary, background: COLORS.primaryLight },
-  { key: 'Memorization', labelKey: 'dashboard.pages.memorization', icon: 'library-outline', iconColor: COLORS.purple, background: COLORS.purpleLight },
-  { key: 'Examinations', labelKey: 'dashboard.pages.examinations', icon: 'document-text-outline', iconColor: COLORS.red, background: COLORS.redLight },
-  { key: 'Behavior', labelKey: 'dashboard.pages.behavior', icon: 'heart-outline', iconColor: COLORS.pink, background: COLORS.pinkLight },
-  { key: 'Goal Setting', labelKey: 'dashboard.pages.goalSetting', icon: 'flag-outline', iconColor: COLORS.cyan, background: COLORS.cyanLight },
-  { key: 'Financial', labelKey: 'dashboard.pages.financial', icon: 'wallet-outline', iconColor: COLORS.gold, background: COLORS.goldLight },
-  { key: 'Reports', labelKey: 'dashboard.pages.reports', icon: 'bar-chart-outline', iconColor: COLORS.purple, background: COLORS.purpleLight },
-  { key: 'Golden Register', labelKey: 'dashboard.pages.goldenRegister', icon: 'trophy-outline', iconColor: COLORS.gold, background: COLORS.goldLight },
-  { key: 'Branches', labelKey: 'dashboard.pages.branches', icon: 'git-branch-outline', iconColor: COLORS.primary, background: COLORS.primaryLight },
-  { key: 'Users', labelKey: 'dashboard.pages.users', icon: 'person-circle-outline', iconColor: COLORS.blue, background: COLORS.blueLight },
+  { key: 'Students', labelKey: 'dashboard.pages.students', icon: 'people-outline', iconColor: COLORS.primary, background: COLORS.primaryLight, permission: 'students' },
+  { key: 'Teachers', labelKey: 'dashboard.pages.teachers', icon: 'school-outline', iconColor: COLORS.blue, background: COLORS.blueLight, permission: 'teachers' },
+  { key: 'Parents', labelKey: 'dashboard.pages.parents', icon: 'home-outline', iconColor: COLORS.purple, background: COLORS.purpleLight, permission: 'parents' },
+  { key: 'Employees', labelKey: 'dashboard.pages.employees', icon: 'briefcase-outline', iconColor: COLORS.cyan, background: COLORS.cyanLight, permission: 'employees' },
+  { key: 'Halaqaat', labelKey: 'dashboard.pages.halaqaat', icon: 'book-outline', iconColor: COLORS.gold, background: COLORS.goldLight, permission: 'halaqaat' },
+  { key: 'Attendance', labelKey: 'dashboard.pages.attendance', icon: 'checkmark-circle-outline', iconColor: COLORS.primary, background: COLORS.primaryLight, permission: 'attendance' },
+  { key: 'Memorization', labelKey: 'dashboard.pages.memorization', icon: 'library-outline', iconColor: COLORS.purple, background: COLORS.purpleLight, permission: 'memorization' },
+  { key: 'Examinations', labelKey: 'dashboard.pages.examinations', icon: 'document-text-outline', iconColor: COLORS.red, background: COLORS.redLight, permission: 'examinations' },
+  { key: 'Behavior', labelKey: 'dashboard.pages.behavior', icon: 'heart-outline', iconColor: COLORS.pink, background: COLORS.pinkLight, permission: 'behavior' },
+  { key: 'Goal Setting', labelKey: 'dashboard.pages.goalSetting', icon: 'flag-outline', iconColor: COLORS.cyan, background: COLORS.cyanLight, permission: 'goal-setting' },
+  { key: 'Financial', labelKey: 'dashboard.pages.financial', icon: 'wallet-outline', iconColor: COLORS.gold, background: COLORS.goldLight, permission: 'financial' },
+  { key: 'Reports', labelKey: 'dashboard.pages.reports', icon: 'bar-chart-outline', iconColor: COLORS.purple, background: COLORS.purpleLight, permission: 'reports' },
+  { key: 'Golden Register', labelKey: 'dashboard.pages.goldenRegister', icon: 'trophy-outline', iconColor: COLORS.gold, background: COLORS.goldLight, permission: 'golden-register' },
+  { key: 'Branches', labelKey: 'dashboard.pages.branches', icon: 'git-branch-outline', iconColor: COLORS.primary, background: COLORS.primaryLight, permission: 'branches' },
+  { key: 'Users', labelKey: 'dashboard.pages.users', icon: 'person-circle-outline', iconColor: COLORS.blue, background: COLORS.blueLight, permission: 'users' },
 ];
 
 // ============================================================
@@ -124,6 +126,14 @@ export const AdminDashboardScreen: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
+
+  // ============================================================
+  // FILTER PAGES BY PERMISSIONS
+  // ============================================================
+  const visiblePages = React.useMemo(
+    () => ADMIN_PAGES.filter((p) => hasPermission(user, p.permission)),
+    [user]
+  );
 
   // ============================================================
   // LOAD DASHBOARD
@@ -350,29 +360,33 @@ export const AdminDashboardScreen: React.FC = () => {
           </View>
         ) : null}
 
-        {/* MANAGE */}
-        <View style={styles.sectionHeader}>
-          <View>
-            <Text style={styles.sectionTitle}>{t('dashboard.manage.title')}</Text>
-            <Text style={styles.sectionSubtitle}>{t('dashboard.manage.subtitle')}</Text>
-          </View>
-          <Text style={styles.pageCountText}>
-            {t('dashboard.manage.modulesCount', { count: ADMIN_PAGES.length })}
-          </Text>
-        </View>
+        {/* MANAGE — filtered by permissions */}
+        {visiblePages.length > 0 && (
+          <>
+            <View style={styles.sectionHeader}>
+              <View>
+                <Text style={styles.sectionTitle}>{t('dashboard.manage.title')}</Text>
+                <Text style={styles.sectionSubtitle}>{t('dashboard.manage.subtitle')}</Text>
+              </View>
+              <Text style={styles.pageCountText}>
+                {t('dashboard.manage.modulesCount', { count: visiblePages.length })}
+              </Text>
+            </View>
 
-        <View style={styles.pagesGrid}>
-          {ADMIN_PAGES.map((page) => (
-            <PageButton
-              key={page.key}
-              icon={page.icon}
-              label={t(page.labelKey)}
-              iconColor={page.iconColor}
-              background={page.background}
-              onPress={() => handlePagePress(page.key)}
-            />
-          ))}
-        </View>
+            <View style={styles.pagesGrid}>
+              {visiblePages.map((page) => (
+                <PageButton
+                  key={page.key}
+                  icon={page.icon}
+                  label={t(page.labelKey)}
+                  iconColor={page.iconColor}
+                  background={page.background}
+                  onPress={() => handlePagePress(page.key)}
+                />
+              ))}
+            </View>
+          </>
+        )}
 
         {/* QUOTE */}
         <View style={styles.quoteCard}>

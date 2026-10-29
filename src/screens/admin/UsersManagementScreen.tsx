@@ -14,10 +14,11 @@ import {
   Alert,
   Share,
   Platform,
+  Linking,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
-import * as Clipboard from 'expo-clipboard';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../../context/AuthContext';
 import { useBranch } from '../../context/BranchContext';
@@ -42,6 +43,8 @@ const COLORS = {
   amberLight: '#FEF3C7',
   teal: '#0D9488',
   tealLight: '#CCFBF1',
+  whatsapp: '#25D366',
+  whatsappLight: '#E7F8EE',
   white: '#FFFFFF',
   slate: '#18392D',
   slateMuted: '#718079',
@@ -84,6 +87,8 @@ interface ManagedUser {
   associatedName?: string;
   firstName?: string;
   lastName?: string;
+  phone?: string;
+  parentPhone?: string;
   role: UserRole;
   branchId?: BranchRef | string | null;
   permissions?: string[];
@@ -136,6 +141,86 @@ const ROLE_VALUES: (UserRole | 'all')[] = [
   'parent',
 ];
 
+// Default WhatsApp message template (editable by the admin)
+const DEFAULT_WHATSAPP_TEMPLATE = `Hello {name},
+
+Your HUFAD account is ready.
+
+Username: {username}
+Password: {password}
+Role: {role}
+Branch: {branch}
+
+Please keep these credentials safe.`;
+
+// Roles that CAN receive a share (students do NOT)
+const SHARABLE_ROLES: UserRole[] = [
+  'admin',
+  'school_admin',
+  'branch_admin',
+  'teacher',
+  'parent',
+];
+
+// ============================================================
+// WHATSAPP HELPERS
+// ============================================================
+const normalizePhoneForWhatsApp = (raw?: string): string | null => {
+  if (!raw) return null;
+  // Strip everything except digits and +
+  let cleaned = raw.replace(/[^\d+]/g, '');
+  if (!cleaned) return null;
+  // Remove leading +
+  if (cleaned.startsWith('+')) cleaned = cleaned.slice(1);
+  // Must be a plausible international number
+  if (cleaned.length < 8) return null;
+  return cleaned;
+};
+
+const applyTemplate = (
+  template: string,
+  vars: Record<string, string>
+): string => {
+  let out = template;
+  Object.entries(vars).forEach(([k, v]) => {
+    out = out.replace(new RegExp(`\\{${k}\\}`, 'g'), v ?? '');
+  });
+  return out;
+};
+
+const openWhatsApp = async (
+  phone: string,
+  message: string
+): Promise<boolean> => {
+  const normalized = normalizePhoneForWhatsApp(phone);
+  if (!normalized) return false;
+
+  const url = `whatsapp://send?phone=${normalized}&text=${encodeURIComponent(
+    message
+  )}`;
+  const fallbackUrl = `https://wa.me/${normalized}?text=${encodeURIComponent(
+    message
+  )}`;
+
+  try {
+    const canOpen = await Linking.canOpenURL(url);
+    if (canOpen) {
+      await Linking.openURL(url);
+      return true;
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    await Linking.openURL(fallbackUrl);
+    return true;
+  } catch (e) {
+    console.warn('WhatsApp open failed', e);
+    return false;
+  }
+};
+
 // ============================================================
 // HELPERS
 // ============================================================
@@ -163,8 +248,10 @@ const parseOne = (res: any): ManagedUser | null => {
 const extractTempPassword = (res: any): string | undefined => {
   if (!res) return undefined;
   if (typeof res.temporaryPassword === 'string') return res.temporaryPassword;
-  if (typeof res.data?.temporaryPassword === 'string') return res.data.temporaryPassword;
-  if (typeof res.user?.temporaryPassword === 'string') return res.user.temporaryPassword;
+  if (typeof res.data?.temporaryPassword === 'string')
+    return res.data.temporaryPassword;
+  if (typeof res.user?.temporaryPassword === 'string')
+    return res.user.temporaryPassword;
   return undefined;
 };
 
@@ -187,13 +274,20 @@ const getBranchName = (user: ManagedUser, t: (k: string) => string) => {
 
 const getRoleColor = (role: UserRole) => {
   switch (role) {
-    case 'admin': return { bg: '#E9D5FF', text: '#6B21A8' };
-    case 'school_admin': return { bg: '#DDD6FE', text: '#5B21B6' };
-    case 'branch_admin': return { bg: '#C7D2FE', text: '#3730A3' };
-    case 'teacher': return { bg: COLORS.blueLight, text: COLORS.blue };
-    case 'student': return { bg: COLORS.primaryLight, text: COLORS.primary };
-    case 'parent': return { bg: COLORS.amberLight, text: COLORS.amber };
-    default: return { bg: '#F1F5F9', text: COLORS.slateMuted };
+    case 'admin':
+      return { bg: '#E9D5FF', text: '#6B21A8' };
+    case 'school_admin':
+      return { bg: '#DDD6FE', text: '#5B21B6' };
+    case 'branch_admin':
+      return { bg: '#C7D2FE', text: '#3730A3' };
+    case 'teacher':
+      return { bg: COLORS.blueLight, text: COLORS.blue };
+    case 'student':
+      return { bg: COLORS.primaryLight, text: COLORS.primary };
+    case 'parent':
+      return { bg: COLORS.amberLight, text: COLORS.amber };
+    default:
+      return { bg: '#F1F5F9', text: COLORS.slateMuted };
   }
 };
 
@@ -209,12 +303,18 @@ const getUserInitials = (user: ManagedUser) => {
 
 const getUserAvatarBg = (role: UserRole) => {
   switch (role) {
-    case 'parent': return COLORS.purple;
-    case 'student': return COLORS.primary;
-    case 'teacher': return COLORS.gold;
-    case 'branch_admin': return COLORS.blue;
-    case 'school_admin': return '#6366F1';
-    default: return COLORS.gray;
+    case 'parent':
+      return COLORS.purple;
+    case 'student':
+      return COLORS.primary;
+    case 'teacher':
+      return COLORS.gold;
+    case 'branch_admin':
+      return COLORS.blue;
+    case 'school_admin':
+      return '#6366F1';
+    default:
+      return COLORS.gray;
   }
 };
 
@@ -223,6 +323,46 @@ const generateUsernameForRole = (role: 'school_admin' | 'branch_admin') => {
   const year = new Date().getFullYear().toString().slice(-2);
   const randomNum = Math.floor(1000 + Math.random() * 9000);
   return `${prefix}${year}${randomNum}`;
+};
+
+// ============================================================
+// WHATSAPP SETTINGS — AsyncStorage wrapper
+// ============================================================
+const WHATSAPP_SETTINGS_PREFIX = '@userManagement/whatsappTemplate';
+
+const whatsappSettingsKey = (tenantId: string, branchId: string) =>
+  `${WHATSAPP_SETTINGS_PREFIX}_${tenantId || 'global'}_${
+    branchId || 'global'
+  }`;
+
+const loadWhatsAppTemplate = async (
+  tenantId: string,
+  branchId: string
+): Promise<string> => {
+  try {
+    const raw = await AsyncStorage.getItem(
+      whatsappSettingsKey(tenantId, branchId)
+    );
+    if (raw && raw.trim()) return raw;
+    return DEFAULT_WHATSAPP_TEMPLATE;
+  } catch {
+    return DEFAULT_WHATSAPP_TEMPLATE;
+  }
+};
+
+const saveWhatsAppTemplate = async (
+  tenantId: string,
+  branchId: string,
+  template: string
+): Promise<void> => {
+  try {
+    await AsyncStorage.setItem(
+      whatsappSettingsKey(tenantId, branchId),
+      template
+    );
+  } catch (e) {
+    console.warn('Failed to save WhatsApp template', e);
+  }
 };
 
 // ============================================================
@@ -248,7 +388,12 @@ const FilterModal: React.FC<{
   }, [visible, roleFilter, branchFilter]);
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+    >
       <View style={styles.modalOverlay}>
         <View style={[styles.modalContainer, { maxHeight: '75%' }]}>
           <View style={styles.modalHeader}>
@@ -316,7 +461,8 @@ const FilterModal: React.FC<{
                 <Text
                   style={[
                     styles.filterChipText,
-                    localBranch === 'school-admin' && styles.filterChipTextActive,
+                    localBranch === 'school-admin' &&
+                      styles.filterChipTextActive,
                   ]}
                 >
                   {t('userManagement.branch.schoolAdmins')}
@@ -338,7 +484,9 @@ const FilterModal: React.FC<{
                     ]}
                   >
                     {b.name}
-                    {b.isMainBranch ? ` (${t('userManagement.branch.main')})` : ''}
+                    {b.isMainBranch
+                      ? ` (${t('userManagement.branch.main')})`
+                      : ''}
                   </Text>
                 </TouchableOpacity>
               ))}
@@ -376,6 +524,169 @@ const FilterModal: React.FC<{
 };
 
 // ============================================================
+// WHATSAPP TEMPLATE SETTINGS MODAL
+// ============================================================
+const WhatsAppSettingsModal: React.FC<{
+  visible: boolean;
+  initialTemplate: string;
+  onClose: () => void;
+  onSave: (template: string) => void;
+}> = ({ visible, initialTemplate, onClose, onSave }) => {
+  const { t } = useTranslation();
+  const [template, setTemplate] = useState(initialTemplate);
+
+  useEffect(() => {
+    if (visible) setTemplate(initialTemplate);
+  }, [visible, initialTemplate]);
+
+  const insertPlaceholder = (key: string) => {
+    setTemplate((prev) => `${prev}{${key}}`);
+  };
+
+  const handleReset = () => {
+    setTemplate(DEFAULT_WHATSAPP_TEMPLATE);
+  };
+
+  const handleSave = () => {
+    if (!template.trim()) {
+      Alert.alert(
+        t('userManagement.whatsapp.errors.emptyTemplate') ||
+          'Template cannot be empty'
+      );
+      return;
+    }
+    onSave(template);
+  };
+
+  return (
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+    >
+      <View style={styles.modalOverlay}>
+        <View style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.modalTitle}>
+                {t('userManagement.whatsapp.title')}
+              </Text>
+              <Text style={styles.modalSubtitle}>
+                {t('userManagement.whatsapp.subtitle')}
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={styles.modalCloseBtn}
+              onPress={onClose}
+            >
+              <Ionicons name="close" size={22} color={COLORS.slate} />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            style={styles.modalBody}
+            keyboardShouldPersistTaps="handled"
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.formLabel}>
+              {t('userManagement.whatsapp.templateLabel')}
+            </Text>
+            <TextInput
+              style={[styles.formInput, styles.templateArea]}
+              value={template}
+              onChangeText={setTemplate}
+              multiline
+              numberOfLines={8}
+              placeholder={DEFAULT_WHATSAPP_TEMPLATE}
+              placeholderTextColor="#A0AAA5"
+            />
+
+            <Text style={styles.formLabel}>
+              {t('userManagement.whatsapp.placeholders')}
+            </Text>
+            <View style={styles.placeholderRow}>
+              {[
+                { key: 'name', label: t('userManagement.whatsapp.ph.name') },
+                {
+                  key: 'username',
+                  label: t('userManagement.whatsapp.ph.username'),
+                },
+                {
+                  key: 'password',
+                  label: t('userManagement.whatsapp.ph.password'),
+                },
+                { key: 'role', label: t('userManagement.whatsapp.ph.role') },
+                {
+                  key: 'branch',
+                  label: t('userManagement.whatsapp.ph.branch'),
+                },
+              ].map((ph) => (
+                <TouchableOpacity
+                  key={ph.key}
+                  style={styles.placeholderChip}
+                  onPress={() => insertPlaceholder(ph.key)}
+                  activeOpacity={0.75}
+                >
+                  <Text style={styles.placeholderChipText}>
+                    {`{${ph.key}}`}
+                  </Text>
+                  <Text style={styles.placeholderChipSub}>{ph.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            <Text style={styles.formHint}>
+              {t('userManagement.whatsapp.hint')}
+            </Text>
+
+            <Text style={[styles.formLabel, { marginTop: 16 }]}>
+              {t('userManagement.whatsapp.preview')}
+            </Text>
+            <View style={styles.previewBox}>
+              <Text style={styles.previewText} numberOfLines={8}>
+                {applyTemplate(template, {
+                  name: 'Ahmed Mohamed',
+                  username: 'SA251234',
+                  password: 'TempPass123',
+                  role: 'Teacher',
+                  branch: 'Main Branch',
+                })}
+              </Text>
+            </View>
+
+            <View style={{ height: 20 }} />
+          </ScrollView>
+
+          <View style={styles.modalActions}>
+            <TouchableOpacity
+              style={styles.actionBtnGhost}
+              onPress={handleReset}
+              activeOpacity={0.75}
+            >
+              <Ionicons name="refresh-outline" size={16} color={COLORS.slate} />
+              <Text style={styles.actionBtnGhostText}>
+                {t('userManagement.whatsapp.reset')}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.actionBtnPrimary}
+              onPress={handleSave}
+              activeOpacity={0.85}
+            >
+              <Ionicons name="checkmark" size={16} color="#fff" />
+              <Text style={styles.actionBtnPrimaryText}>
+                {t('userManagement.whatsapp.save')}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+};
+
+// ============================================================
 // USER DETAILS MODAL
 // ============================================================
 const UserDetailsModal: React.FC<{
@@ -385,17 +696,40 @@ const UserDetailsModal: React.FC<{
   onTogglePassword: () => void;
   onClose: () => void;
   onShare: () => void;
+  onWhatsApp: () => void;
   onEdit: () => void;
   onDelete: () => void;
-}> = ({ visible, user, showPassword, onTogglePassword, onClose, onShare, onEdit, onDelete }) => {
+}> = ({
+  visible,
+  user,
+  showPassword,
+  onTogglePassword,
+  onClose,
+  onShare,
+  onWhatsApp,
+  onEdit,
+  onDelete,
+}) => {
   const { t } = useTranslation();
   if (!user) return null;
   const rc = getRoleColor(user.role);
   const isSystemUser = user.role === 'parent' || user.role === 'student';
-  const canManage = ['admin', 'school_admin', 'branch_admin'].includes(user.role);
+  const canManage = ['admin', 'school_admin', 'branch_admin'].includes(
+    user.role
+  );
+  const canWhatsApp = SHARABLE_ROLES.includes(user.role);
+  const phone =
+    user.role === 'student'
+      ? user.parentPhone || user.phone
+      : user.phone;
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+    >
       <View style={styles.modalOverlay}>
         <View style={styles.modalContainer}>
           <View style={styles.modalHeader}>
@@ -407,16 +741,29 @@ const UserDetailsModal: React.FC<{
             </TouchableOpacity>
           </View>
 
-          <ScrollView style={styles.modalBody} showsVerticalScrollIndicator={false}>
+          <ScrollView
+            style={styles.modalBody}
+            showsVerticalScrollIndicator={false}
+          >
             <View style={styles.modalProfile}>
-              <View style={[styles.modalAvatar, { backgroundColor: getUserAvatarBg(user.role) }]}>
+              <View
+                style={[
+                  styles.modalAvatar,
+                  { backgroundColor: getUserAvatarBg(user.role) },
+                ]}
+              >
                 <Text style={styles.modalAvatarText}>{getUserInitials(user)}</Text>
               </View>
               <Text style={styles.modalName}>
                 {user.associatedName || user.username}
               </Text>
               <Text style={styles.modalEmail}>{user.email || '—'}</Text>
-              <View style={[styles.roleBadgeLg, { backgroundColor: rc.bg, marginTop: 10 }]}>
+              <View
+                style={[
+                  styles.roleBadgeLg,
+                  { backgroundColor: rc.bg, marginTop: 10 },
+                ]}
+              >
                 <Text style={[styles.roleBadgeLgText, { color: rc.text }]}>
                   {getRoleLabel(user.role, t)}
                 </Text>
@@ -425,7 +772,11 @@ const UserDetailsModal: React.FC<{
 
             <View style={styles.infoRow}>
               <View style={styles.infoIcon}>
-                <Ionicons name="person-outline" size={16} color={COLORS.primary} />
+                <Ionicons
+                  name="person-outline"
+                  size={16}
+                  color={COLORS.primary}
+                />
               </View>
               <View style={styles.infoContent}>
                 <Text style={styles.infoLabel}>
@@ -446,10 +797,14 @@ const UserDetailsModal: React.FC<{
                 <View style={styles.passwordRow}>
                   <Text style={styles.infoValue}>
                     {showPassword
-                      ? user.temporaryPassword || t('userManagement.details.notSet')
+                      ? user.temporaryPassword ||
+                        t('userManagement.details.notSet')
                       : '••••••••'}
                   </Text>
-                  <TouchableOpacity onPress={onTogglePassword} style={styles.iconBtnSmall}>
+                  <TouchableOpacity
+                    onPress={onTogglePassword}
+                    style={styles.iconBtnSmall}
+                  >
                     <Ionicons
                       name={showPassword ? 'eye-off-outline' : 'eye-outline'}
                       size={16}
@@ -460,9 +815,31 @@ const UserDetailsModal: React.FC<{
               </View>
             </View>
 
+            {!!phone && (
+              <View style={styles.infoRow}>
+                <View style={styles.infoIcon}>
+                  <Ionicons
+                    name="call-outline"
+                    size={16}
+                    color={COLORS.primary}
+                  />
+                </View>
+                <View style={styles.infoContent}>
+                  <Text style={styles.infoLabel}>
+                    {t('userManagement.details.phone') || 'Phone'}
+                  </Text>
+                  <Text style={styles.infoValue}>{phone}</Text>
+                </View>
+              </View>
+            )}
+
             <View style={styles.infoRow}>
               <View style={styles.infoIcon}>
-                <Ionicons name="location-outline" size={16} color={COLORS.primary} />
+                <Ionicons
+                  name="location-outline"
+                  size={16}
+                  color={COLORS.primary}
+                />
               </View>
               <View style={styles.infoContent}>
                 <Text style={styles.infoLabel}>
@@ -474,7 +851,11 @@ const UserDetailsModal: React.FC<{
 
             <View style={styles.infoRow}>
               <View style={styles.infoIcon}>
-                <Ionicons name="shield-outline" size={16} color={COLORS.primary} />
+                <Ionicons
+                  name="shield-outline"
+                  size={16}
+                  color={COLORS.primary}
+                />
               </View>
               <View style={styles.infoContent}>
                 <Text style={styles.infoLabel}>
@@ -490,14 +871,20 @@ const UserDetailsModal: React.FC<{
 
             <View style={styles.infoRow}>
               <View style={styles.infoIcon}>
-                <Ionicons name="calendar-outline" size={16} color={COLORS.primary} />
+                <Ionicons
+                  name="calendar-outline"
+                  size={16}
+                  color={COLORS.primary}
+                />
               </View>
               <View style={styles.infoContent}>
                 <Text style={styles.infoLabel}>
                   {t('userManagement.details.created')}
                 </Text>
                 <Text style={styles.infoValue}>
-                  {user.createdAt ? new Date(user.createdAt).toLocaleDateString() : '—'}
+                  {user.createdAt
+                    ? new Date(user.createdAt).toLocaleDateString()
+                    : '—'}
                 </Text>
               </View>
             </View>
@@ -523,22 +910,59 @@ const UserDetailsModal: React.FC<{
           </ScrollView>
 
           <View style={styles.modalActions}>
-            <TouchableOpacity style={styles.actionBtnOutline} onPress={onShare}>
-              <Ionicons name="share-outline" size={16} color={COLORS.primary} />
+            {canWhatsApp && (
+              <TouchableOpacity
+                style={styles.actionBtnWhatsApp}
+                onPress={onWhatsApp}
+                activeOpacity={0.85}
+              >
+                <Ionicons
+                  name="logo-whatsapp"
+                  size={16}
+                  color={COLORS.white}
+                />
+                <Text style={styles.actionBtnWhatsAppText}>
+                  {t('userManagement.actions.whatsapp')}
+                </Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={styles.actionBtnOutline}
+              onPress={onShare}
+            >
+              <Ionicons
+                name="share-outline"
+                size={16}
+                color={COLORS.primary}
+              />
               <Text style={styles.actionBtnOutlineText}>
                 {t('userManagement.actions.share')}
               </Text>
             </TouchableOpacity>
             {canManage ? (
               <>
-                <TouchableOpacity style={styles.actionBtnOutline} onPress={onEdit}>
-                  <Ionicons name="create-outline" size={16} color={COLORS.primary} />
+                <TouchableOpacity
+                  style={styles.actionBtnOutline}
+                  onPress={onEdit}
+                >
+                  <Ionicons
+                    name="create-outline"
+                    size={16}
+                    color={COLORS.primary}
+                  />
                   <Text style={styles.actionBtnOutlineText}>
                     {t('userManagement.actions.edit')}
                   </Text>
                 </TouchableOpacity>
-                <TouchableOpacity style={styles.actionBtnDanger} onPress={onDelete}>
-                  <Ionicons name="trash-outline" size={16} color={COLORS.red} />
+                <TouchableOpacity
+                  style={styles.actionBtnDanger}
+                  onPress={onDelete}
+                >
+                  <Ionicons
+                    name="trash-outline"
+                    size={16}
+                    color={COLORS.red}
+                  />
                   <Text style={styles.actionBtnDangerText}>
                     {t('userManagement.actions.delete')}
                   </Text>
@@ -546,7 +970,11 @@ const UserDetailsModal: React.FC<{
               </>
             ) : (
               <View style={styles.autoCreatedPill}>
-                <Ionicons name="information-circle-outline" size={14} color={COLORS.slateMuted} />
+                <Ionicons
+                  name="information-circle-outline"
+                  size={14}
+                  color={COLORS.slateMuted}
+                />
                 <Text style={styles.autoCreatedText}>
                   {isSystemUser
                     ? t('userManagement.details.autoCreated')
@@ -571,8 +999,18 @@ const UserFormModal: React.FC<{
   availableBranches: BranchRef[];
   currentUserRole?: string;
   onClose: () => void;
-  onSubmit: (data: FormState) => Promise<{ generatedPassword?: string } | void>;
-}> = ({ visible, isEditing, initialUser, availableBranches, currentUserRole, onClose, onSubmit }) => {
+  onSubmit: (
+    data: FormState
+  ) => Promise<{ generatedPassword?: string } | void>;
+}> = ({
+  visible,
+  isEditing,
+  initialUser,
+  availableBranches,
+  currentUserRole,
+  onClose,
+  onSubmit,
+}) => {
   const { t } = useTranslation();
 
   const blank: FormState = {
@@ -604,7 +1042,9 @@ const UserFormModal: React.FC<{
       setForm({
         username: initialUser.username,
         role:
-          initialUser.role === 'branch_admin' ? 'branch_admin' : 'school_admin',
+          initialUser.role === 'branch_admin'
+            ? 'branch_admin'
+            : 'school_admin',
         branchId: getBranchId(initialUser) || '',
         password: '',
         confirmPassword: '',
@@ -689,7 +1129,12 @@ const UserFormModal: React.FC<{
   const visibleBranches = useMemo(() => availableBranches, [availableBranches]);
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
+    <Modal
+      visible={visible}
+      transparent
+      animationType="slide"
+      onRequestClose={onClose}
+    >
       <View style={styles.modalOverlay}>
         <View style={styles.modalContainer}>
           <View style={styles.modalHeader}>
@@ -698,15 +1143,26 @@ const UserFormModal: React.FC<{
                 ? t('userManagement.form.editTitle')
                 : t('userManagement.form.createTitle')}
             </Text>
-            <TouchableOpacity style={styles.modalCloseBtn} onPress={onClose} disabled={loading}>
+            <TouchableOpacity
+              style={styles.modalCloseBtn}
+              onPress={onClose}
+              disabled={loading}
+            >
               <Ionicons name="close" size={22} color={COLORS.slate} />
             </TouchableOpacity>
           </View>
 
-          <ScrollView style={styles.modalBody} showsVerticalScrollIndicator={false}>
+          <ScrollView
+            style={styles.modalBody}
+            showsVerticalScrollIndicator={false}
+          >
             {error ? (
               <View style={styles.modalErrorBox}>
-                <Ionicons name="alert-circle" size={16} color={COLORS.red} />
+                <Ionicons
+                  name="alert-circle"
+                  size={16}
+                  color={COLORS.red}
+                />
                 <Text style={styles.modalErrorText}>{error}</Text>
               </View>
             ) : null}
@@ -732,15 +1188,21 @@ const UserFormModal: React.FC<{
                   style={styles.shareBtn}
                   onPress={() =>
                     Share.share({
-                      message: `${t('userManagement.messages.shareCredentialsHeader')}\n${t(
-                        'userManagement.details.username'
-                      )}: ${form.username}\n${t(
+                      message: `${t(
+                        'userManagement.messages.shareCredentialsHeader'
+                      )}\n${t('userManagement.details.username')}: ${
+                        form.username
+                      }\n${t(
                         'userManagement.details.password'
                       )}: ${generatedPassword}`,
                     })
                   }
                 >
-                  <Ionicons name="share-outline" size={14} color={COLORS.primary} />
+                  <Ionicons
+                    name="share-outline"
+                    size={14}
+                    color={COLORS.primary}
+                  />
                   <Text style={styles.shareBtnText}>
                     {t('userManagement.form.shareCredentials')}
                   </Text>
@@ -799,24 +1261,28 @@ const UserFormModal: React.FC<{
                     </Text>
                   ) : (
                     visibleBranches.map((b) => {
-                      const disabled = form.role === 'school_admin' || isEditing;
+                      const disabled =
+                        form.role === 'school_admin' || isEditing;
                       return (
                         <TouchableOpacity
                           key={b._id}
                           style={[
                             styles.filterChip,
-                            form.branchId === b._id && styles.filterChipActive,
+                            form.branchId === b._id &&
+                              styles.filterChipActive,
                             disabled && { opacity: 0.5 },
                           ]}
                           onPress={() =>
-                            !disabled && setForm({ ...form, branchId: b._id })
+                            !disabled &&
+                            setForm({ ...form, branchId: b._id })
                           }
                           disabled={disabled}
                         >
                           <Text
                             style={[
                               styles.filterChipText,
-                              form.branchId === b._id && styles.filterChipTextActive,
+                              form.branchId === b._id &&
+                                styles.filterChipTextActive,
                             ]}
                           >
                             {b.name}
@@ -836,10 +1302,14 @@ const UserFormModal: React.FC<{
                 <View style={styles.inputRow}>
                   <TextInput
                     style={[styles.formInput, { flex: 1 }]}
-                    placeholder={t('userManagement.form.usernamePlaceholder')}
+                    placeholder={t(
+                      'userManagement.form.usernamePlaceholder'
+                    )}
                     placeholderTextColor="#A0AAA5"
                     value={form.username}
-                    onChangeText={(v) => setForm({ ...form, username: v })}
+                    onChangeText={(v) =>
+                      setForm({ ...form, username: v })
+                    }
                     autoCapitalize="none"
                     editable={!isEditing && !loading}
                   />
@@ -853,7 +1323,11 @@ const UserFormModal: React.FC<{
                         })
                       }
                     >
-                      <Ionicons name="refresh" size={16} color={COLORS.primary} />
+                      <Ionicons
+                        name="refresh"
+                        size={16}
+                        color={COLORS.primary}
+                      />
                     </TouchableOpacity>
                   )}
                 </View>
@@ -878,18 +1352,24 @@ const UserFormModal: React.FC<{
 
                 <View style={styles.permGrid}>
                   {AVAILABLE_PAGE_IDS.map((pageId) => {
-                    if (pageId === 'branches' && form.role === 'branch_admin') return null;
+                    if (pageId === 'branches' && form.role === 'branch_admin')
+                      return null;
                     const checked = form.permissions.includes(pageId);
                     return (
                       <TouchableOpacity
                         key={pageId}
-                        style={[styles.permTile, checked && styles.permTileActive]}
+                        style={[
+                          styles.permTile,
+                          checked && styles.permTileActive,
+                        ]}
                         onPress={() => handleTogglePermission(pageId)}
                       >
                         <Ionicons
                           name={checked ? 'checkbox' : 'square-outline'}
                           size={16}
-                          color={checked ? COLORS.primary : COLORS.slateMuted}
+                          color={
+                            checked ? COLORS.primary : COLORS.slateMuted
+                          }
                         />
                         <Text
                           style={[
@@ -908,7 +1388,8 @@ const UserFormModal: React.FC<{
                   {t('userManagement.form.selectedCount', {
                     count: form.permissions.length,
                     total: AVAILABLE_PAGE_IDS.filter(
-                      (p) => !(p === 'branches' && form.role === 'branch_admin')
+                      (p) =>
+                        !(p === 'branches' && form.role === 'branch_admin')
                     ).length,
                   })}
                 </Text>
@@ -918,11 +1399,18 @@ const UserFormModal: React.FC<{
                     <TouchableOpacity
                       style={styles.checkboxRow}
                       onPress={() =>
-                        setForm({ ...form, generatePassword: !form.generatePassword })
+                        setForm({
+                          ...form,
+                          generatePassword: !form.generatePassword,
+                        })
                       }
                     >
                       <Ionicons
-                        name={form.generatePassword ? 'checkbox' : 'square-outline'}
+                        name={
+                          form.generatePassword
+                            ? 'checkbox'
+                            : 'square-outline'
+                        }
                         size={20}
                         color={COLORS.primary}
                       />
@@ -933,27 +1421,45 @@ const UserFormModal: React.FC<{
 
                     {!form.generatePassword && (
                       <>
-                        <Text style={[styles.formLabel, { marginTop: 10 }]}>
+                        <Text
+                          style={[
+                            styles.formLabel,
+                            { marginTop: 10 },
+                          ]}
+                        >
                           {t('userManagement.form.password')}
                         </Text>
                         <TextInput
                           style={styles.formInput}
-                          placeholder={t('userManagement.form.passwordPlaceholder')}
+                          placeholder={t(
+                            'userManagement.form.passwordPlaceholder'
+                          )}
                           placeholderTextColor="#A0AAA5"
                           value={form.password}
-                          onChangeText={(v) => setForm({ ...form, password: v })}
+                          onChangeText={(v) =>
+                            setForm({ ...form, password: v })
+                          }
                           secureTextEntry
                         />
 
-                        <Text style={[styles.formLabel, { marginTop: 12 }]}>
+                        <Text
+                          style={[
+                            styles.formLabel,
+                            { marginTop: 12 },
+                          ]}
+                        >
                           {t('userManagement.form.confirmPassword')}
                         </Text>
                         <TextInput
                           style={styles.formInput}
-                          placeholder={t('userManagement.form.confirmPasswordPlaceholder')}
+                          placeholder={t(
+                            'userManagement.form.confirmPasswordPlaceholder'
+                          )}
                           placeholderTextColor="#A0AAA5"
                           value={form.confirmPassword}
-                          onChangeText={(v) => setForm({ ...form, confirmPassword: v })}
+                          onChangeText={(v) =>
+                            setForm({ ...form, confirmPassword: v })
+                          }
                           secureTextEntry
                         />
                       </>
@@ -978,7 +1484,10 @@ const UserFormModal: React.FC<{
                 </Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.filterApplyBtn, loading && { opacity: 0.7 }]}
+                style={[
+                  styles.filterApplyBtn,
+                  loading && { opacity: 0.7 },
+                ]}
                 onPress={handleSave}
                 disabled={loading}
               >
@@ -1006,7 +1515,7 @@ const UserFormModal: React.FC<{
 export const UserManagementScreen: React.FC = () => {
   const { t } = useTranslation();
   const { user: currentUser } = useAuth();
-  const { branches } = useBranch();
+  const { branches, currentBranch } = useBranch();
 
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1027,6 +1536,19 @@ export const UserManagementScreen: React.FC = () => {
   const [isEditing, setIsEditing] = useState(false);
   const [editingUser, setEditingUser] = useState<ManagedUser | null>(null);
 
+  // WhatsApp
+  const [whatsappTemplate, setWhatsappTemplate] = useState(
+    DEFAULT_WHATSAPP_TEMPLATE
+  );
+  const [showWhatsAppSettings, setShowWhatsAppSettings] = useState(false);
+
+  // Tenant + branch keys for per-tenant template
+  const tenantId =
+    (currentUser as any)?.tenantId ||
+    (currentBranch as any)?.tenantId ||
+    'global';
+  const branchKey = (currentBranch as any)?._id || 'global';
+
   // ============================================================
   // BANNERS
   // ============================================================
@@ -1044,7 +1566,10 @@ export const UserManagementScreen: React.FC = () => {
   // ============================================================
   const availableBranches: BranchRef[] = useMemo(() => {
     const list: BranchRef[] = Array.isArray(branches) ? branches : [];
-    if (currentUser?.role === 'school_admin' || currentUser?.role === 'admin') {
+    if (
+      currentUser?.role === 'school_admin' ||
+      currentUser?.role === 'admin'
+    ) {
       return list;
     }
     if ((currentUser as any)?.branchId) {
@@ -1052,6 +1577,16 @@ export const UserManagementScreen: React.FC = () => {
     }
     return [];
   }, [branches, currentUser]);
+
+  // ============================================================
+  // LOAD TEMPLATE
+  // ============================================================
+  useEffect(() => {
+    (async () => {
+      const saved = await loadWhatsAppTemplate(tenantId, branchKey);
+      setWhatsappTemplate(saved);
+    })();
+  }, [tenantId, branchKey]);
 
   // ============================================================
   // FETCH USERS
@@ -1086,7 +1621,11 @@ export const UserManagementScreen: React.FC = () => {
 
   useEffect(() => {
     if (!currentUser) return;
-    if (!['admin', 'school_admin', 'branch_admin'].includes(currentUser.role as string)) {
+    if (
+      !['admin', 'school_admin', 'branch_admin'].includes(
+        currentUser.role as string
+      )
+    ) {
       setLoading(false);
       return;
     }
@@ -1138,19 +1677,32 @@ export const UserManagementScreen: React.FC = () => {
   }, [roleFilter, branchFilter]);
 
   // ============================================================
-  // ACTIONS
+  // SHARE HELPERS
   // ============================================================
+  const buildMessageForUser = (user: ManagedUser) => {
+    const name =
+      user.associatedName ||
+      `${user.firstName || ''} ${user.lastName || ''}`.trim() ||
+      user.username;
+
+    return applyTemplate(whatsappTemplate, {
+      name,
+      username: user.username,
+      password: user.temporaryPassword || '',
+      role: getRoleLabel(user.role, t),
+      branch: getBranchName(user, t),
+    });
+  };
+
+  const getRecipientPhone = (user: ManagedUser): string | undefined => {
+    if (user.role === 'student') {
+      return user.parentPhone || user.phone;
+    }
+    return user.phone;
+  };
+
   const shareCredentials = async (user: ManagedUser) => {
-    const msg = `${t('userManagement.messages.shareCredentialsHeader')}\nName: ${
-      user.associatedName || user.username
-    }\n${t('userManagement.details.username')}: ${user.username}\n${t(
-      'userManagement.details.password'
-    )}: ${user.temporaryPassword || t('userManagement.details.notSet')}\n${t(
-      'userManagement.filter.role'
-    )}: ${getRoleLabel(user.role, t)}\n${t('userManagement.details.branch')}: ${getBranchName(
-      user,
-      t
-    )}`;
+    const msg = buildMessageForUser(user);
     try {
       await Share.share({ message: msg });
     } catch {
@@ -1158,6 +1710,28 @@ export const UserManagementScreen: React.FC = () => {
         t('userManagement.banners.shareFailedTitle'),
         t('userManagement.banners.shareFailedMsg')
       );
+    }
+  };
+
+  const shareToWhatsApp = async (user: ManagedUser) => {
+    const phone = getRecipientPhone(user);
+    if (!phone) {
+      Alert.alert(
+        t('userManagement.whatsapp.noPhoneTitle') || 'No phone number',
+        t('userManagement.whatsapp.noPhoneMsg') ||
+          'This user does not have a phone number on file.'
+      );
+      return;
+    }
+    const msg = buildMessageForUser(user);
+    const ok = await openWhatsApp(phone, msg);
+    if (!ok) {
+      Alert.alert(
+        t('userManagement.whatsapp.failedTitle') || 'WhatsApp not available',
+        t('userManagement.whatsapp.failedMsg') ||
+          'Could not open WhatsApp. Falling back to system share.'
+      );
+      await shareCredentials(user);
     }
   };
 
@@ -1246,7 +1820,9 @@ export const UserManagementScreen: React.FC = () => {
                 branchId: branchId
                   ? {
                       _id: branchId,
-                      name: availableBranches.find((b) => b._id === branchId)?.name,
+                      name: availableBranches.find(
+                        (b) => b._id === branchId
+                      )?.name,
                     }
                   : null,
               } as ManagedUser)
@@ -1301,11 +1877,25 @@ export const UserManagementScreen: React.FC = () => {
   };
 
   // ============================================================
+  // WHATSAPP SETTINGS SAVE
+  // ============================================================
+  const handleSaveWhatsAppTemplate = async (template: string) => {
+    setWhatsappTemplate(template);
+    await saveWhatsAppTemplate(tenantId, branchKey, template);
+    setShowWhatsAppSettings(false);
+    flashSuccess(
+      t('userManagement.whatsapp.saved') || 'Template saved successfully'
+    );
+  };
+
+  // ============================================================
   // ACCESS GATE
   // ============================================================
   const canAccess =
     currentUser &&
-    ['admin', 'school_admin', 'branch_admin'].includes(currentUser.role as string);
+    ['admin', 'school_admin', 'branch_admin'].includes(
+      currentUser.role as string
+    );
 
   if (!canAccess) {
     return (
@@ -1331,6 +1921,8 @@ export const UserManagementScreen: React.FC = () => {
   const renderUser = ({ item }: { item: ManagedUser }) => {
     const rc = getRoleColor(item.role);
     const isSystemUser = item.role === 'parent' || item.role === 'student';
+    const canWhatsApp = SHARABLE_ROLES.includes(item.role);
+    const phone = getRecipientPhone(item);
 
     return (
       <TouchableOpacity
@@ -1339,7 +1931,12 @@ export const UserManagementScreen: React.FC = () => {
         onPress={() => handleOpenDetails(item)}
       >
         <View style={styles.userRow}>
-          <View style={[styles.avatar, { backgroundColor: getUserAvatarBg(item.role) }]}>
+          <View
+            style={[
+              styles.avatar,
+              { backgroundColor: getUserAvatarBg(item.role) },
+            ]}
+          >
             <Text style={styles.avatarText}>{getUserInitials(item)}</Text>
           </View>
 
@@ -1358,7 +1955,11 @@ export const UserManagementScreen: React.FC = () => {
                 </Text>
               </View>
               <View style={styles.branchTag}>
-                <Ionicons name="location-outline" size={10} color={COLORS.slateMuted} />
+                <Ionicons
+                  name="location-outline"
+                  size={10}
+                  color={COLORS.slateMuted}
+                />
                 <Text style={styles.branchTagText} numberOfLines={1}>
                   {getBranchName(item, t)}
                 </Text>
@@ -1367,7 +1968,11 @@ export const UserManagementScreen: React.FC = () => {
 
             {item.permissions && (
               <Text style={styles.permCountInline}>
-                <Ionicons name="shield-outline" size={10} color={COLORS.slateMuted} />{' '}
+                <Ionicons
+                  name="shield-outline"
+                  size={10}
+                  color={COLORS.slateMuted}
+                />{' '}
                 {item.permissions.length > 0
                   ? t('userManagement.details.pagesCount', {
                       count: item.permissions.length,
@@ -1377,7 +1982,37 @@ export const UserManagementScreen: React.FC = () => {
             )}
           </View>
 
-          <Ionicons name="chevron-forward" size={16} color="#B7C3BD" />
+          {/* Share actions */}
+          <View style={styles.cardActions}>
+            {canWhatsApp && (
+              <TouchableOpacity
+                style={[
+                  styles.cardIconBtn,
+                  { backgroundColor: COLORS.whatsappLight },
+                  !phone && styles.cardIconBtnDisabled,
+                ]}
+                onPress={() => shareToWhatsApp(item)}
+                hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+              >
+                <Ionicons
+                  name="logo-whatsapp"
+                  size={16}
+                  color={phone ? COLORS.whatsapp : COLORS.gray}
+                />
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity
+              style={styles.cardIconBtn}
+              onPress={() => shareCredentials(item)}
+              hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+            >
+              <Ionicons
+                name="share-outline"
+                size={16}
+                color={COLORS.primary}
+              />
+            </TouchableOpacity>
+          </View>
         </View>
 
         {isSystemUser && (
@@ -1421,25 +2056,31 @@ export const UserManagementScreen: React.FC = () => {
         <View style={styles.headerActions}>
           <TouchableOpacity
             style={styles.headerIconBtn}
-            onPress={() =>
-              Alert.alert(
-                t('userManagement.exportComingSoonTitle'),
-                t('userManagement.exportComingSoonMsg')
-              )
-            }
+            onPress={() => setShowWhatsAppSettings(true)}
           >
-            <Ionicons name="download-outline" size={20} color={COLORS.slate} />
+            <Ionicons
+              name="chatbubble-ellipses-outline"
+              size={20}
+              color={COLORS.slate}
+            />
           </TouchableOpacity>
 
           <TouchableOpacity
             style={styles.headerIconBtn}
             onPress={() => setShowFilterModal(true)}
           >
-            <Ionicons name="filter-outline" size={20} color={COLORS.slate} />
+            <Ionicons
+              name="filter-outline"
+              size={20}
+              color={COLORS.slate}
+            />
             {activeFilterCount > 0 && <View style={styles.filterDot} />}
           </TouchableOpacity>
 
-          <TouchableOpacity style={styles.addButton} onPress={handleOpenCreate}>
+          <TouchableOpacity
+            style={styles.addButton}
+            onPress={handleOpenCreate}
+          >
             <Ionicons name="person-add" size={20} color={COLORS.white} />
           </TouchableOpacity>
         </View>
@@ -1459,7 +2100,11 @@ export const UserManagementScreen: React.FC = () => {
       ) : null}
       {success ? (
         <View style={styles.successBanner}>
-          <Ionicons name="checkmark-circle" size={18} color={COLORS.primary} />
+          <Ionicons
+            name="checkmark-circle"
+            size={18}
+            color={COLORS.primary}
+          />
           <Text style={styles.successText} numberOfLines={2}>
             {success}
           </Text>
@@ -1480,7 +2125,11 @@ export const UserManagementScreen: React.FC = () => {
           />
           {searchTerm.length > 0 && (
             <TouchableOpacity onPress={() => setSearchTerm('')}>
-              <Ionicons name="close-circle" size={18} color={COLORS.gray} />
+              <Ionicons
+                name="close-circle"
+                size={18}
+                color={COLORS.gray}
+              />
             </TouchableOpacity>
           )}
         </View>
@@ -1504,8 +2153,8 @@ export const UserManagementScreen: React.FC = () => {
               <Text style={styles.activeFilterText}>
                 {branchFilter === 'school-admin'
                   ? t('userManagement.branch.schoolAdmins')
-                  : availableBranches.find((b) => b._id === branchFilter)?.name ||
-                    t('userManagement.filter.branch')}
+                  : availableBranches.find((b) => b._id === branchFilter)
+                      ?.name || t('userManagement.filter.branch')}
               </Text>
               <TouchableOpacity onPress={() => setBranchFilter('all')}>
                 <Ionicons name="close" size={14} color={COLORS.primary} />
@@ -1573,7 +2222,10 @@ export const UserManagementScreen: React.FC = () => {
                   </Text>
                 </TouchableOpacity>
               ) : (
-                <TouchableOpacity style={styles.emptyButton} onPress={handleOpenCreate}>
+                <TouchableOpacity
+                  style={styles.emptyButton}
+                  onPress={handleOpenCreate}
+                >
                   <Text style={styles.emptyButtonText}>
                     {t('userManagement.createUser')}
                   </Text>
@@ -1597,6 +2249,13 @@ export const UserManagementScreen: React.FC = () => {
         }}
       />
 
+      <WhatsAppSettingsModal
+        visible={showWhatsAppSettings}
+        initialTemplate={whatsappTemplate}
+        onClose={() => setShowWhatsAppSettings(false)}
+        onSave={handleSaveWhatsAppTemplate}
+      />
+
       <UserDetailsModal
         visible={showDetailsModal}
         user={selectedUser}
@@ -1604,6 +2263,7 @@ export const UserManagementScreen: React.FC = () => {
         onTogglePassword={() => setShowPasswordInModal((v) => !v)}
         onClose={() => setShowDetailsModal(false)}
         onShare={() => selectedUser && shareCredentials(selectedUser)}
+        onWhatsApp={() => selectedUser && shareToWhatsApp(selectedUser)}
         onEdit={() => selectedUser && handleOpenEdit(selectedUser)}
         onDelete={() => selectedUser && handleDelete(selectedUser)}
       />
@@ -1648,7 +2308,11 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: 16,
   },
-  accessDeniedTitle: { fontSize: 20, fontWeight: '800', color: COLORS.slate },
+  accessDeniedTitle: {
+    fontSize: 20,
+    fontWeight: '800',
+    color: COLORS.slate,
+  },
   accessDeniedText: {
     fontSize: 14,
     color: COLORS.slateMuted,
@@ -1731,7 +2395,12 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#BFE9D4',
   },
-  successText: { flex: 1, fontSize: 12, color: COLORS.primary, fontWeight: '600' },
+  successText: {
+    flex: 1,
+    fontSize: 12,
+    color: COLORS.primary,
+    fontWeight: '600',
+  },
 
   searchContainer: { paddingHorizontal: 16, paddingBottom: 8 },
   searchWrapper: {
@@ -1744,7 +2413,12 @@ const styles = StyleSheet.create({
     borderColor: COLORS.border,
     height: 44,
   },
-  searchInput: { flex: 1, marginLeft: 8, fontSize: 14, color: COLORS.slate },
+  searchInput: {
+    flex: 1,
+    marginLeft: 8,
+    fontSize: 14,
+    color: COLORS.slate,
+  },
 
   activeFiltersRow: {
     flexDirection: 'row',
@@ -1763,7 +2437,11 @@ const styles = StyleSheet.create({
     borderRadius: 20,
     gap: 4,
   },
-  activeFilterText: { fontSize: 11, fontWeight: '600', color: COLORS.primary },
+  activeFilterText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: COLORS.primary,
+  },
   clearFiltersText: {
     fontSize: 11,
     fontWeight: '600',
@@ -1816,9 +2494,17 @@ const styles = StyleSheet.create({
     color: COLORS.slateMuted,
     fontWeight: '600',
     marginBottom: 6,
-    fontFamily: Platform.select({ ios: 'Courier', android: 'monospace' }),
+    fontFamily: Platform.select({
+      ios: 'Courier',
+      android: 'monospace',
+    }),
   },
-  userTags: { flexDirection: 'row', gap: 6, flexWrap: 'wrap', marginBottom: 6 },
+  userTags: {
+    flexDirection: 'row',
+    gap: 6,
+    flexWrap: 'wrap',
+    marginBottom: 6,
+  },
   tag: { paddingHorizontal: 8, paddingVertical: 3, borderRadius: 8 },
   tagText: { fontSize: 10, fontWeight: '700' },
   branchTag: {
@@ -1831,8 +2517,16 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     maxWidth: '70%',
   },
-  branchTagText: { fontSize: 10, fontWeight: '600', color: COLORS.slateMuted },
-  permCountInline: { fontSize: 10, color: COLORS.slateMuted, fontWeight: '600' },
+  branchTagText: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: COLORS.slateMuted,
+  },
+  permCountInline: {
+    fontSize: 10,
+    color: COLORS.slateMuted,
+    fontWeight: '600',
+  },
   autoCreatedRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1842,7 +2536,30 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: COLORS.border,
   },
-  autoCreatedInline: { fontSize: 10, color: COLORS.slateMuted, fontStyle: 'italic' },
+  autoCreatedInline: {
+    fontSize: 10,
+    color: COLORS.slateMuted,
+    fontStyle: 'italic',
+  },
+
+  cardActions: {
+    flexDirection: 'column',
+    gap: 6,
+    marginLeft: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cardIconBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: COLORS.background,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  cardIconBtnDisabled: { opacity: 0.55 },
 
   emptyContainer: {
     alignItems: 'center',
@@ -1870,7 +2587,11 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
     borderRadius: 10,
   },
-  emptyButtonText: { color: COLORS.white, fontWeight: '700', fontSize: 13 },
+  emptyButtonText: {
+    color: COLORS.white,
+    fontWeight: '700',
+    fontSize: 13,
+  },
 
   modalOverlay: {
     flex: 1,
@@ -1890,8 +2611,14 @@ const styles = StyleSheet.create({
     padding: 20,
     borderBottomWidth: 1,
     borderBottomColor: COLORS.border,
+    gap: 10,
   },
   modalTitle: { fontSize: 18, fontWeight: '800', color: COLORS.slate },
+  modalSubtitle: {
+    fontSize: 12,
+    color: COLORS.slateMuted,
+    marginTop: 2,
+  },
   modalCloseBtn: {
     width: 34,
     height: 34,
@@ -1919,7 +2646,11 @@ const styles = StyleSheet.create({
     paddingVertical: 6,
     borderRadius: 999,
   },
-  roleBadgeLgText: { fontSize: 12, fontWeight: '800', letterSpacing: 0.3 },
+  roleBadgeLgText: {
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 0.3,
+  },
 
   infoRow: {
     flexDirection: 'row',
@@ -1969,7 +2700,11 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     borderRadius: 8,
   },
-  permPillText: { fontSize: 10, fontWeight: '600', color: COLORS.slate },
+  permPillText: {
+    fontSize: 10,
+    fontWeight: '600',
+    color: COLORS.slate,
+  },
 
   modalActions: {
     flexDirection: 'row',
@@ -2013,6 +2748,54 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: COLORS.red,
   },
+  actionBtnWhatsApp: {
+    flexBasis: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: COLORS.whatsapp,
+    gap: 6,
+  },
+  actionBtnWhatsAppText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#fff',
+  },
+  actionBtnGhost: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: COLORS.background,
+    gap: 6,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  actionBtnGhostText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: COLORS.slate,
+  },
+  actionBtnPrimary: {
+    flex: 2,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    borderRadius: 12,
+    backgroundColor: COLORS.primary,
+    gap: 6,
+  },
+  actionBtnPrimaryText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#fff',
+  },
+
   autoCreatedPill: {
     flex: 1,
     flexDirection: 'row',
@@ -2024,13 +2807,18 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.background,
     minWidth: 90,
   },
-  autoCreatedText: { fontSize: 12, fontWeight: '600', color: COLORS.slateMuted },
+  autoCreatedText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.slateMuted,
+  },
 
   formLabel: {
     fontSize: 12,
     fontWeight: '700',
     color: COLORS.slateMuted,
     marginBottom: 6,
+    marginTop: 12,
     textTransform: 'uppercase',
     letterSpacing: 0.3,
   },
@@ -2043,6 +2831,16 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: COLORS.slate,
     backgroundColor: COLORS.white,
+  },
+  templateArea: {
+    minHeight: 160,
+    textAlignVertical: 'top',
+    fontFamily: Platform.select({
+      ios: 'Menlo',
+      android: 'monospace',
+    }),
+    fontSize: 13,
+    lineHeight: 19,
   },
   formHint: {
     fontSize: 11,
@@ -2060,6 +2858,50 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
 
+  placeholderRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 4,
+  },
+  placeholderChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    backgroundColor: COLORS.primaryLight,
+    borderWidth: 1,
+    borderColor: COLORS.primary + '44',
+  },
+  placeholderChipText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: COLORS.primary,
+    fontFamily: Platform.select({
+      ios: 'Menlo',
+      android: 'monospace',
+    }),
+  },
+  placeholderChipSub: {
+    fontSize: 9,
+    fontWeight: '600',
+    color: COLORS.slateMuted,
+    marginTop: 2,
+  },
+
+  previewBox: {
+    marginTop: 4,
+    backgroundColor: '#F1F5F9',
+    borderRadius: 10,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: COLORS.border,
+  },
+  previewText: {
+    fontSize: 13,
+    color: COLORS.slate,
+    lineHeight: 19,
+  },
+
   filterSectionTitle: {
     fontSize: 13,
     fontWeight: '800',
@@ -2067,7 +2909,11 @@ const styles = StyleSheet.create({
     marginTop: 8,
     marginBottom: 10,
   },
-  filterChipsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  filterChipsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
   filterChip: {
     paddingHorizontal: 12,
     paddingVertical: 8,
@@ -2080,7 +2926,11 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primary,
     borderColor: COLORS.primary,
   },
-  filterChipText: { fontSize: 12, fontWeight: '600', color: COLORS.slateMuted },
+  filterChipText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.slateMuted,
+  },
   filterChipTextActive: { color: '#fff' },
 
   permHeaderRow: {
@@ -2091,7 +2941,11 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   permHeaderActions: { flexDirection: 'row', gap: 12 },
-  linkPrimary: { fontSize: 12, fontWeight: '700', color: COLORS.primary },
+  linkPrimary: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.primary,
+  },
   linkDanger: { fontSize: 12, fontWeight: '700', color: COLORS.red },
   permGrid: {
     flexDirection: 'row',
@@ -2119,7 +2973,11 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.primaryLight,
     borderColor: COLORS.primary,
   },
-  permTileText: { fontSize: 12, fontWeight: '600', color: COLORS.slateMuted },
+  permTileText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.slateMuted,
+  },
   permTileTextActive: { color: COLORS.primary },
   permCountText: {
     fontSize: 11,
@@ -2134,13 +2992,18 @@ const styles = StyleSheet.create({
     gap: 8,
     marginTop: 14,
   },
-  checkboxLabel: { fontSize: 13, color: COLORS.slate, fontWeight: '600' },
+  checkboxLabel: {
+    fontSize: 13,
+    color: COLORS.slate,
+    fontWeight: '600',
+  },
 
   successBox: {
     backgroundColor: COLORS.primaryLight,
     borderRadius: 12,
     padding: 16,
     marginBottom: 16,
+    marginTop: 16,
     borderWidth: 1,
     borderColor: '#BFE9D4',
   },
@@ -2156,12 +3019,19 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 8,
   },
-  credLabel: { fontSize: 12, color: COLORS.slateMuted, fontWeight: '600' },
+  credLabel: {
+    fontSize: 12,
+    color: COLORS.slateMuted,
+    fontWeight: '600',
+  },
   credValue: {
     fontSize: 13,
     fontWeight: '800',
     color: COLORS.slate,
-    fontFamily: Platform.select({ ios: 'Courier', android: 'monospace' }),
+    fontFamily: Platform.select({
+      ios: 'Courier',
+      android: 'monospace',
+    }),
   },
   shareBtn: {
     flexDirection: 'row',
@@ -2176,7 +3046,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.primary,
   },
-  shareBtnText: { fontSize: 12, fontWeight: '700', color: COLORS.primary },
+  shareBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.primary,
+  },
   doneBtn: {
     marginTop: 12,
     backgroundColor: COLORS.primary,
@@ -2221,7 +3095,11 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: COLORS.border,
   },
-  filterResetBtnText: { fontSize: 14, fontWeight: '700', color: COLORS.slate },
+  filterResetBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.slate,
+  },
   filterApplyBtn: {
     flex: 2,
     paddingVertical: 12,
@@ -2230,5 +3108,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  filterApplyBtnText: { fontSize: 14, fontWeight: '700', color: COLORS.white },
+  filterApplyBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.white,
+  },
 });

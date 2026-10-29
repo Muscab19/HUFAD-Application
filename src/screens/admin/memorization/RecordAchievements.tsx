@@ -11,7 +11,6 @@ import {
   StyleSheet,
   Modal,
   ScrollView,
-  Alert,
   KeyboardAvoidingView,
   Platform,
 } from 'react-native';
@@ -19,17 +18,22 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useTranslation } from 'react-i18next';
 import { useBranch } from '../../../context/BranchContext';
+import { enqueue } from '../../../utils/offlineDb';
+import { useNetworkStatus } from '../../../hooks/useNetworkStatus';
+
 import {
   COLORS,
-  SURAH_LIST,
   TASHIIH_TOPICS,
+  READING_WRITING_TOPICS,
   ACHIEVEMENT_TYPES,
-  AchievementType,
   Achievement,
   AchievementFormState,
   Student,
   Halaqah,
+  SubacGroup,
+  GroupType,
   api,
+  groupApi,
   getMaxAyah,
   getTypeInfo,
   getRangeDisplay,
@@ -37,6 +41,17 @@ import {
   getStudentName,
   getTopicLabel,
 } from './_shared';
+import {
+  SurahPicker,
+  JuzPicker,
+  QuarterPicker,
+  FeedbackModal,
+  FeedbackTone,
+  FeedbackButton,
+} from './_shared/pickers';
+import { GroupsSection } from './GroupsSection';
+import { BooksModal } from './BooksModal';
+import { GroupRecordModal } from './GroupRecordModal';
 
 // ============================================================
 // HELPERS
@@ -81,6 +96,7 @@ const getEmptyForm = (studentId: string): AchievementFormState => ({
   comment: '',
   topic: '',
   customTopic: '',
+  rwNote: '',
 });
 
 // ============================================================
@@ -89,6 +105,7 @@ const getEmptyForm = (studentId: string): AchievementFormState => ({
 export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack }) => {
   const { t } = useTranslation();
   const { currentBranch } = useBranch();
+  const { isOnline } = useNetworkStatus();
 
   // List state
   const [halaqat, setHalaqat] = useState<Halaqah[]>([]);
@@ -101,6 +118,14 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
 
+  // Groups
+  const [groups, setGroups] = useState<SubacGroup[]>([]);
+  const [recordGroup, setRecordGroup] = useState<SubacGroup | null>(null);
+
+  // Books
+  const [books, setBooks] = useState<any[]>([]);
+  const [booksOpen, setBooksOpen] = useState(false);
+
   // Add/Edit modal
   const [formVisible, setFormVisible] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
@@ -111,7 +136,25 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
   const [formError, setFormError] = useState('');
 
   // ============================================================
-  // LOAD HALAQAAT (once)
+  // FEEDBACK POPUP (replaces Alert.alert)
+  // ============================================================
+  const [feedback, setFeedback] = useState<{
+    visible: boolean;
+    tone: FeedbackTone;
+    title: string;
+    message?: string;
+    buttons?: FeedbackButton[];
+  }>({ visible: false, tone: 'info', title: '' });
+
+  const notify = (
+    tone: FeedbackTone,
+    title: string,
+    message?: string,
+    buttons?: FeedbackButton[]
+  ) => setFeedback({ visible: true, tone, title, message, buttons });
+
+  // ============================================================
+  // LOAD HALAQAAT + BOOKS (once)
   // ============================================================
   useEffect(() => {
     (async () => {
@@ -122,16 +165,43 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
           ...list,
         ];
         setHalaqat(withAll);
-        if (!selectedHalaqah && withAll.length > 0) {
-          setSelectedHalaqah(withAll[0]);
-        }
+        if (!selectedHalaqah && withAll.length > 0) setSelectedHalaqah(withAll[0]);
       } catch (err: any) {
         console.error('Load halaqat error:', err);
         setError(err?.message || t('memorization.record.loadHalaqatFailed'));
       }
     })();
+
+    (async () => {
+      try {
+        const list = await api.getBooks();
+        setBooks(list);
+      } catch {
+        setBooks([]);
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ============================================================
+  // LOAD GROUPS from the server (same source as the web app)
+  // Re-fetch when the branch changes.
+  // ============================================================
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const list = await groupApi.list();
+        if (!cancelled) setGroups(list);
+      } catch (e) {
+        console.warn('Failed to load groups:', e);
+        if (!cancelled) setGroups([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentBranch?._id]);
 
   // ============================================================
   // LOAD STUDENTS + TODAY'S ACHIEVEMENTS
@@ -174,6 +244,93 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
   };
 
   // ============================================================
+  // GROUPS: server-backed create / update / delete
+  // ============================================================
+  const handleCreateGroup = async (input: {
+    name: string;
+    type: GroupType;
+    members: string[];
+    halaqahId?: string;
+    halaqahName?: string;
+  }) => {
+    try {
+      const created = await groupApi.create(input);
+      setGroups((prev) => [created, ...prev]);
+      notify(
+        'success',
+        t('memorization.group_created') || 'Group created',
+        created.name
+      );
+    } catch (e: any) {
+      console.error('Create group failed', e);
+      notify(
+        'error',
+        t('memorization.failed_to_save') || 'Failed to save',
+        e?.message || ''
+      );
+    }
+  };
+
+  const handleUpdateGroup = async (g: SubacGroup) => {
+    try {
+      const updated = await groupApi.update(g.id, {
+        name: g.name,
+        type: g.type,
+        members: g.members,
+        halaqahId: g.halaqahId,
+        halaqahName: g.halaqahName,
+      });
+      setGroups((prev) =>
+        prev.map((x) => (x.id === updated.id ? updated : x))
+      );
+      notify(
+        'success',
+        t('memorization.group_updated') || 'Group updated',
+        updated.name
+      );
+    } catch (e: any) {
+      console.error('Update group failed', e);
+      notify(
+        'error',
+        t('memorization.failed_to_update') || 'Failed to update',
+        e?.message || ''
+      );
+    }
+  };
+
+  const handleDeleteGroup = (g: SubacGroup) => {
+    notify(
+      'warning',
+      t('memorization.delete_confirm') || 'Delete this group?',
+      g.name,
+      [
+        { text: t('memorization.cancel') || 'Cancel', style: 'cancel' },
+        {
+          text: t('memorization.delete') || 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await groupApi.remove(g.id);
+              setGroups((prev) => prev.filter((x) => x.id !== g.id));
+              notify(
+                'success',
+                t('memorization.group_deleted') || 'Group deleted'
+              );
+            } catch (e: any) {
+              console.error('Delete group failed', e);
+              notify(
+                'error',
+                t('memorization.failed_to_delete') || 'Failed to delete',
+                e?.message || ''
+              );
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  // ============================================================
   // FILTER
   // ============================================================
   const filteredStudents = useMemo(() => {
@@ -188,22 +345,39 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
   }, [students, searchTerm]);
 
   const getTodayCount = useCallback(
-    (studentId: string): number => {
-      return todayAchievements.filter((a) => getStudentId(a) === studentId).length;
-    },
+    (studentId: string): number =>
+      todayAchievements.filter((a) => getStudentId(a) === studentId).length,
     [todayAchievements]
   );
 
+  // ============================================================
+  // LAST ACHIEVEMENTS (bulk fetch from server, cached)
+  // ============================================================
+  const [lastMap, setLastMap] = useState<Record<string, Achievement>>({});
+
+  useEffect(() => {
+    if (!students.length) {
+      setLastMap({});
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const map = await api.getLastAchievements(students.map((s) => s._id));
+        if (!cancelled) setLastMap(map || {});
+      } catch (e) {
+        console.warn('Failed to load last achievements', e);
+        if (!cancelled) setLastMap({});
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [students]);
+
   const getLastAchievement = useCallback(
-    (studentId: string): Achievement | null => {
-      const list = todayAchievements
-        .filter((a) => getStudentId(a) === studentId)
-        .sort(
-          (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
-        );
-      return list[0] || null;
-    },
-    [todayAchievements]
+    (studentId: string): Achievement | null => lastMap[studentId] || null,
+    [lastMap]
   );
 
   // ============================================================
@@ -218,7 +392,10 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
       base.rangeType = last.rangeType || 'surah';
       base.fromSurah = last.toSurah || 1;
       base.fromAyah = last.toAyah ? last.toAyah + 1 : 1;
-      if (last.rangeType === 'surah' && base.fromAyah > getMaxAyah(base.fromSurah)) {
+      if (
+        last.rangeType === 'surah' &&
+        base.fromAyah > getMaxAyah(base.fromSurah)
+      ) {
         base.fromSurah = Math.min(114, base.fromSurah + 1);
         base.fromAyah = 1;
       }
@@ -260,7 +437,9 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
       fromQuarter: achievement.fromQuarter || 1,
       toJuz: achievement.toJuz || 1,
       toQuarter: achievement.toQuarter || 8,
-      fromBookPage: achievement.fromBookPage ? String(achievement.fromBookPage) : '',
+      fromBookPage: achievement.fromBookPage
+        ? String(achievement.fromBookPage)
+        : '',
       toBookPage: achievement.toBookPage ? String(achievement.toBookPage) : '',
       bookId: achievement.bookId || '',
       bookName: achievement.bookName || '',
@@ -269,6 +448,7 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
       comment: achievement.comment || '',
       topic: achievement.topic || '',
       customTopic: '',
+      rwNote: achievement.rwNote || '',
     };
 
     setForm(base);
@@ -292,13 +472,18 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
       setFormError(t('memorization.modal.errors.selectTopic'));
       return;
     }
+    if (form.type === 'reading_writing' && !form.topic) {
+      setFormError(t('memorization.modal.errors.selectTopic'));
+      return;
+    }
 
     setSaving(true);
     setFormError('');
 
     try {
       const totalMarks = form.type === 'subac' ? 100 : 10;
-      const rawScore = parseInt(form.score, 10) || (form.type === 'subac' ? 80 : 8);
+      const rawScore =
+        parseInt(form.score, 10) || (form.type === 'subac' ? 80 : 8);
       const score = Math.min(totalMarks, Math.max(0, rawScore));
 
       const payload: any = {
@@ -322,6 +507,12 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
         let topic = form.topic;
         if (topic === 'Other') topic = form.customTopic || 'Other';
         payload.topic = topic;
+      } else if (form.type === 'reading_writing') {
+        let topic = form.topic;
+        if (topic === 'Other') topic = form.customTopic || 'Other';
+        payload.topic = topic;
+        payload.rwNote = form.rwNote || '';
+        payload.comment = form.comment || '';
       } else if (form.type === 'book_review') {
         if (form.bookId) payload.bookId = form.bookId;
         payload.bookName = form.bookName;
@@ -345,22 +536,61 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
         }
       }
 
+      // Edits need a live server (they upsert by _id already).
+      // Only NEW records go into the offline queue.
       if (isEditing && editingId) {
+        if (!isOnline) {
+          setFormError(
+            'You must be online to edit an existing record.'
+          );
+          setSaving(false);
+          return;
+        }
         await api.updateAchievement(editingId, payload);
-        Alert.alert(
+        notify(
+          'success',
           t('memorization.modal.updatedTitle'),
           t('memorization.modal.updatedMsg')
         );
-      } else {
+        setFormVisible(false);
+        await loadData();
+        return;
+      }
+
+      // -------- OFFLINE PATH (new record only) --------
+      if (!isOnline) {
+        await enqueue('memorization', currentBranch._id, payload);
+        setFormVisible(false);
+        notify(
+          'success',
+          t('memorization.modal.savedTitle'),
+          'Saved offline — will sync automatically'
+        );
+        await loadData();
+        return;
+      }
+
+      // -------- ONLINE PATH (new record) --------
+      try {
         await api.createAchievement(payload);
-        Alert.alert(
+        notify(
+          'success',
           t('memorization.modal.savedTitle'),
           t('memorization.modal.savedMsg', { name: selectedStudent.name })
         );
+        setFormVisible(false);
+        await loadData();
+      } catch (err: any) {
+        // Weak signal / timeout / server error → queue silently
+        await enqueue('memorization', currentBranch._id, payload);
+        setFormVisible(false);
+        notify(
+          'success',
+          t('memorization.modal.savedTitle'),
+          'Saved offline — will sync automatically'
+        );
+        await loadData();
       }
-
-      setFormVisible(false);
-      await loadData();
     } catch (err: any) {
       console.error('Save achievement error:', err);
       setFormError(
@@ -379,7 +609,8 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
   // ============================================================
   const handleDelete = (achievement: Achievement) => {
     const typeLabel = getTypeInfo(achievement.type, t).label;
-    Alert.alert(
+    notify(
+      'warning',
       t('memorization.modal.deleteTitle'),
       t('memorization.modal.deleteConfirm', { type: typeLabel }),
       [
@@ -392,7 +623,8 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
               await api.deleteAchievement(achievement._id);
               await loadData();
             } catch (err: any) {
-              Alert.alert(
+              notify(
+                'error',
                 t('memorization.modal.errorTitle'),
                 err?.message || t('memorization.modal.deleteFailed')
               );
@@ -476,6 +708,12 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
             })}
           </Text>
         </View>
+        <TouchableOpacity
+          style={styles.headerAction}
+          onPress={() => setBooksOpen(true)}
+        >
+          <Ionicons name="library-outline" size={18} color={COLORS.primary} />
+        </TouchableOpacity>
       </View>
 
       {/* CONTROLS */}
@@ -520,6 +758,17 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
           </ScrollView>
         )}
       </View>
+
+      {/* GROUPS SECTION */}
+      <GroupsSection
+        groups={groups}
+        students={students}
+        halaqat={halaqat}
+        onCreate={handleCreateGroup}
+        onUpdate={handleUpdateGroup}
+        onDelete={handleDeleteGroup}
+        onRecord={(g) => setRecordGroup(g)}
+      />
 
       {/* SEARCH */}
       <View style={styles.searchContainer}>
@@ -623,6 +872,28 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
         </View>
       )}
 
+      {/* BOOKS MODAL */}
+      <BooksModal
+        visible={booksOpen}
+        books={books}
+        onClose={() => setBooksOpen(false)}
+        onChange={setBooks}
+        branchId={currentBranch?._id}
+      />
+
+      {/* GROUP RECORD MODAL */}
+      <GroupRecordModal
+        visible={!!recordGroup}
+        group={recordGroup}
+        students={students}
+        defaultDate={date}
+        onClose={() => setRecordGroup(null)}
+        onSaved={async () => {
+          await loadData();
+        }}
+        branchId={currentBranch?._id}
+      />
+
       {/* ============ ADD / EDIT MODAL ============ */}
       <Modal
         visible={formVisible}
@@ -679,10 +950,7 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
                       key={type.value}
                       style={[
                         styles.typeChip,
-                        active && {
-                          backgroundColor: type.bg,
-                          borderColor: type.color,
-                        },
+                        active && { backgroundColor: type.bg, borderColor: type.color },
                       ]}
                       onPress={() =>
                         setForm((prev) => ({ ...prev, type: type.value }))
@@ -718,10 +986,7 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
                       return (
                         <TouchableOpacity
                           key={topic}
-                          style={[
-                            styles.topicChip,
-                            active && styles.topicChipActive,
-                          ]}
+                          style={[styles.topicChip, active && styles.topicChipActive]}
                           onPress={() => setForm((prev) => ({ ...prev, topic }))}
                         >
                           <Text
@@ -730,7 +995,7 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
                               active && styles.topicChipTextActive,
                             ]}
                           >
-                            {getTopicLabel(topic, t)}
+                            {getTopicLabel(topic, t, 'tashiih')}
                           </Text>
                         </TouchableOpacity>
                       );
@@ -750,256 +1015,187 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
                 </>
               )}
 
-              {/* Range type */}
-              {form.type !== 'tashiih' && form.type !== 'book_review' && (
+              {/* Reading & Writing topics + note */}
+              {form.type === 'reading_writing' && (
                 <>
                   <Text style={styles.formLabel}>
-                    {t('memorization.modal.rangeType')}
+                    {t('memorization.modal.topic')}
                   </Text>
                   <View style={styles.chipRow}>
-                    {(['surah', 'juz'] as const).map((rt) => {
-                      const active = form.rangeType === rt;
+                    {READING_WRITING_TOPICS.map((topic) => {
+                      const active = form.topic === topic;
                       return (
                         <TouchableOpacity
-                          key={rt}
-                          style={[
-                            styles.rangeChip,
-                            active && styles.rangeChipActive,
-                          ]}
-                          onPress={() =>
-                            setForm((prev) => ({ ...prev, rangeType: rt }))
-                          }
+                          key={topic}
+                          style={[styles.topicChip, active && styles.topicChipActive]}
+                          onPress={() => setForm((prev) => ({ ...prev, topic }))}
                         >
                           <Text
                             style={[
-                              styles.rangeChipText,
-                              active && styles.rangeChipTextActive,
+                              styles.topicChipText,
+                              active && styles.topicChipTextActive,
                             ]}
                           >
-                            {rt === 'surah'
-                              ? t('memorization.modal.surah')
-                              : t('memorization.modal.juz')}
+                            {getTopicLabel(topic, t, 'rw')}
                           </Text>
                         </TouchableOpacity>
                       );
                     })}
                   </View>
-
-                  {form.rangeType === 'surah' ? (
-                    <>
-                      <Text style={styles.formLabel}>
-                        {t('memorization.modal.from')}
-                      </Text>
-                      <View style={styles.twoCol}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.miniLabel}>
-                            {t('memorization.modal.surahLabel')}
-                          </Text>
-                          <TextInput
-                            style={styles.formInput}
-                            value={String(form.fromSurah)}
-                            onChangeText={(v) => {
-                              const n = Math.max(
-                                1,
-                                Math.min(114, parseInt(v, 10) || 1)
-                              );
-                              setForm((prev) => ({ ...prev, fromSurah: n }));
-                            }}
-                            keyboardType="numeric"
-                          />
-                          <Text style={styles.formHint} numberOfLines={1}>
-                            {SURAH_LIST.find((s) => s.id === form.fromSurah)?.name}
-                          </Text>
-                        </View>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.miniLabel}>
-                            {t('memorization.modal.ayahLabel')}
-                          </Text>
-                          <TextInput
-                            style={styles.formInput}
-                            value={String(form.fromAyah)}
-                            onChangeText={(v) => {
-                              const max = getMaxAyah(form.fromSurah);
-                              const n = Math.max(
-                                1,
-                                Math.min(max, parseInt(v, 10) || 1)
-                              );
-                              setForm((prev) => ({ ...prev, fromAyah: n }));
-                            }}
-                            keyboardType="numeric"
-                          />
-                          <Text style={styles.formHint}>
-                            {t('memorization.modal.ayahMax', {
-                              max: getMaxAyah(form.fromSurah),
-                            })}
-                          </Text>
-                        </View>
-                      </View>
-
-                      <Text style={styles.formLabel}>
-                        {t('memorization.modal.to')}
-                      </Text>
-                      <View style={styles.twoCol}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.miniLabel}>
-                            {t('memorization.modal.surahLabel')}
-                          </Text>
-                          <TextInput
-                            style={styles.formInput}
-                            value={String(form.toSurah)}
-                            onChangeText={(v) => {
-                              const n = Math.max(
-                                1,
-                                Math.min(114, parseInt(v, 10) || 1)
-                              );
-                              setForm((prev) => ({ ...prev, toSurah: n }));
-                            }}
-                            keyboardType="numeric"
-                          />
-                          <Text style={styles.formHint} numberOfLines={1}>
-                            {SURAH_LIST.find((s) => s.id === form.toSurah)?.name}
-                          </Text>
-                        </View>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.miniLabel}>
-                            {t('memorization.modal.ayahLabel')}
-                          </Text>
-                          <TextInput
-                            style={styles.formInput}
-                            value={String(form.toAyah)}
-                            onChangeText={(v) => {
-                              const max = getMaxAyah(form.toSurah);
-                              const n = Math.max(
-                                1,
-                                Math.min(max, parseInt(v, 10) || 1)
-                              );
-                              setForm((prev) => ({ ...prev, toAyah: n }));
-                            }}
-                            keyboardType="numeric"
-                          />
-                          <Text style={styles.formHint}>
-                            {t('memorization.modal.ayahMax', {
-                              max: getMaxAyah(form.toSurah),
-                            })}
-                          </Text>
-                        </View>
-                      </View>
-                    </>
-                  ) : (
-                    <>
-                      <Text style={styles.formLabel}>
-                        {t('memorization.modal.from')}
-                      </Text>
-                      <View style={styles.twoCol}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.miniLabel}>
-                            {t('memorization.modal.juzLabel')}
-                          </Text>
-                          <TextInput
-                            style={styles.formInput}
-                            value={String(form.fromJuz)}
-                            onChangeText={(v) => {
-                              const n = Math.max(
-                                1,
-                                Math.min(30, parseInt(v, 10) || 1)
-                              );
-                              setForm((prev) => ({ ...prev, fromJuz: n }));
-                            }}
-                            keyboardType="numeric"
-                          />
-                        </View>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.miniLabel}>
-                            {t('memorization.modal.quarterLabel')}
-                          </Text>
-                          <TextInput
-                            style={styles.formInput}
-                            value={String(form.fromQuarter)}
-                            onChangeText={(v) => {
-                              const n = Math.max(
-                                1,
-                                Math.min(8, parseInt(v, 10) || 1)
-                              );
-                              setForm((prev) => ({ ...prev, fromQuarter: n }));
-                            }}
-                            keyboardType="numeric"
-                          />
-                        </View>
-                      </View>
-
-                      <Text style={styles.formLabel}>
-                        {t('memorization.modal.to')}
-                      </Text>
-                      <View style={styles.twoCol}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.miniLabel}>
-                            {t('memorization.modal.juzLabel')}
-                          </Text>
-                          <TextInput
-                            style={styles.formInput}
-                            value={String(form.toJuz)}
-                            onChangeText={(v) => {
-                              const n = Math.max(
-                                1,
-                                Math.min(30, parseInt(v, 10) || 1)
-                              );
-                              setForm((prev) => ({ ...prev, toJuz: n }));
-                            }}
-                            keyboardType="numeric"
-                          />
-                        </View>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.miniLabel}>
-                            {t('memorization.modal.quarterLabel')}
-                          </Text>
-                          <TextInput
-                            style={styles.formInput}
-                            value={String(form.toQuarter)}
-                            onChangeText={(v) => {
-                              const n = Math.max(
-                                1,
-                                Math.min(8, parseInt(v, 10) || 1)
-                              );
-                              setForm((prev) => ({ ...prev, toQuarter: n }));
-                            }}
-                            keyboardType="numeric"
-                          />
-                        </View>
-                      </View>
-                    </>
+                  {form.topic === 'Other' && (
+                    <TextInput
+                      style={styles.formInput}
+                      value={form.customTopic}
+                      onChangeText={(v) =>
+                        setForm((prev) => ({ ...prev, customTopic: v }))
+                      }
+                      placeholder={t('memorization.modal.topicCustomPlaceholder')}
+                      placeholderTextColor="#A0AAA5"
+                    />
                   )}
-
                   <Text style={styles.formLabel}>
-                    {t('memorization.modal.attempt')}
+                    {t('memorization.modal.rwNote') || 'Note'}
                   </Text>
-                  <View style={styles.chipRow}>
-                    {['1', '2', '3', '4', '5'].map((a) => {
-                      const active = form.attempt === a;
-                      return (
-                        <TouchableOpacity
-                          key={a}
-                          style={[
-                            styles.attemptChip,
-                            active && styles.attemptChipActive,
-                          ]}
-                          onPress={() =>
-                            setForm((prev) => ({ ...prev, attempt: a }))
-                          }
-                        >
-                          <Text
-                            style={[
-                              styles.attemptChipText,
-                              active && styles.attemptChipTextActive,
-                            ]}
-                          >
-                            {a}
-                          </Text>
-                        </TouchableOpacity>
-                      );
-                    })}
-                  </View>
+                  <TextInput
+                    style={[styles.formInput, styles.textArea]}
+                    value={form.rwNote}
+                    onChangeText={(v) => setForm((prev) => ({ ...prev, rwNote: v }))}
+                    multiline
+                    numberOfLines={3}
+                    placeholder={t('memorization.modal.rwNotePlaceholder') || '...'}
+                    placeholderTextColor="#A0AAA5"
+                  />
                 </>
               )}
+
+              {/* Range type */}
+              {form.type !== 'tashiih' &&
+                form.type !== 'book_review' &&
+                form.type !== 'reading_writing' && (
+                  <>
+                    <Text style={styles.formLabel}>
+                      {t('memorization.modal.rangeType')}
+                    </Text>
+                    <View style={styles.chipRow}>
+                      {(['surah', 'juz'] as const).map((rt) => {
+                        const active = form.rangeType === rt;
+                        return (
+                          <TouchableOpacity
+                            key={rt}
+                            style={[
+                              styles.rangeChip,
+                              active && styles.rangeChipActive,
+                            ]}
+                            onPress={() =>
+                              setForm((prev) => ({ ...prev, rangeType: rt }))
+                            }
+                          >
+                            <Text
+                              style={[
+                                styles.rangeChipText,
+                                active && styles.rangeChipTextActive,
+                              ]}
+                            >
+                              {rt === 'surah'
+                                ? t('memorization.modal.surah')
+                                : t('memorization.modal.juz')}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+
+                    {form.rangeType === 'surah' ? (
+                      <>
+                        <SurahPicker
+                          value={form.fromSurah}
+                          onChange={(id) =>
+                            setForm((prev) => ({ ...prev, fromSurah: id }))
+                          }
+                          showAyah
+                          ayahValue={form.fromAyah}
+                          onAyahChange={(a) =>
+                            setForm((prev) => ({ ...prev, fromAyah: a }))
+                          }
+                          label={t('memorization.modal.from')}
+                        />
+                        <SurahPicker
+                          value={form.toSurah}
+                          onChange={(id) =>
+                            setForm((prev) => ({ ...prev, toSurah: id }))
+                          }
+                          showAyah
+                          ayahValue={form.toAyah}
+                          onAyahChange={(a) =>
+                            setForm((prev) => ({ ...prev, toAyah: a }))
+                          }
+                          label={t('memorization.modal.to')}
+                        />
+                      </>
+                    ) : (
+                      <>
+                        <JuzPicker
+                          value={form.fromJuz}
+                          onChange={(id) =>
+                            setForm((prev) => ({ ...prev, fromJuz: id }))
+                          }
+                          label={t('memorization.modal.from')}
+                        />
+                        <QuarterPicker
+                          value={form.fromQuarter}
+                          onChange={(v) =>
+                            setForm((prev) => ({ ...prev, fromQuarter: v }))
+                          }
+                          label={t('memorization.modal.quarterLabel')}
+                        />
+                        <JuzPicker
+                          value={form.toJuz}
+                          onChange={(id) =>
+                            setForm((prev) => ({ ...prev, toJuz: id }))
+                          }
+                          label={t('memorization.modal.to')}
+                        />
+                        <QuarterPicker
+                          value={form.toQuarter}
+                          onChange={(v) =>
+                            setForm((prev) => ({ ...prev, toQuarter: v }))
+                          }
+                          label={t('memorization.modal.quarterLabel')}
+                        />
+                      </>
+                    )}
+
+                    <Text style={styles.formLabel}>
+                      {t('memorization.modal.attempt')}
+                    </Text>
+                    <View style={styles.chipRow}>
+                      {['1', '2', '3', '4', '5'].map((a) => {
+                        const active = form.attempt === a;
+                        return (
+                          <TouchableOpacity
+                            key={a}
+                            style={[
+                              styles.attemptChip,
+                              active && styles.attemptChipActive,
+                            ]}
+                            onPress={() =>
+                              setForm((prev) => ({ ...prev, attempt: a }))
+                            }
+                          >
+                            <Text
+                              style={[
+                                styles.attemptChipText,
+                                active && styles.attemptChipTextActive,
+                              ]}
+                            >
+                              {a}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+                  </>
+                )}
 
               {/* Book review fields */}
               {form.type === 'book_review' && (
@@ -1126,6 +1322,16 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
           </View>
         </KeyboardAvoidingView>
       </Modal>
+
+      {/* Professional feedback popup (replaces Alert.alert) */}
+      <FeedbackModal
+        visible={feedback.visible}
+        tone={feedback.tone}
+        title={feedback.title}
+        message={feedback.message}
+        buttons={feedback.buttons}
+        onClose={() => setFeedback((p) => ({ ...p, visible: false }))}
+      />
     </SafeAreaView>
   );
 };
@@ -1133,11 +1339,10 @@ export const RecordAchievements: React.FC<{ onBack: () => void }> = ({ onBack })
 export default RecordAchievements;
 
 // ============================================================
-// STYLES (unchanged)
+// STYLES
 // ============================================================
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: COLORS.background },
-
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1155,6 +1360,16 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderWidth: 1,
     borderColor: COLORS.border,
+  },
+  headerAction: {
+    width: 38,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: COLORS.primaryLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: COLORS.primaryLight,
   },
   headerTitle: { fontSize: 20, fontWeight: '800', color: COLORS.slate },
   headerSubtitle: { fontSize: 12, color: COLORS.slateMuted, marginTop: 2 },
@@ -1498,3 +1713,5 @@ const styles = StyleSheet.create({
   },
   saveBtnText: { fontSize: 14, fontWeight: '700', color: '#fff' },
 });
+
+// t('memorization.modal.savedMsg', { name: selectedStudent.name })

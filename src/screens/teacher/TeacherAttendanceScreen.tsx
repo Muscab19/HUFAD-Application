@@ -22,6 +22,8 @@ import { useNavigation } from '@react-navigation/native';
 import { useAuth } from '../../context/AuthContext';
 import { useBranch } from '../../context/BranchContext';
 import { api as apiClient } from '../../api/client';
+import { enqueue } from '../../utils/offlineDb';
+import { useNetworkStatus } from '../../hooks/useNetworkStatus';
 
 // ============================================================
 // COLORS
@@ -117,6 +119,7 @@ export const TeacherAttendanceScreen: React.FC = () => {
   const navigation = useNavigation<any>();
   const { user } = useAuth();
   const { currentBranch } = useBranch();
+  const { isOnline } = useNetworkStatus();
 
   // List state
   const [halaqat, setHalaqat] = useState<Halaqah[]>([]);
@@ -370,12 +373,35 @@ export const TeacherAttendanceScreen: React.FC = () => {
     }
 
     setSaving(true);
-    try {
-      const payload: any = { records, branchId: currentBranch._id };
-      if (attendanceCount > 1 && selectedSlot) {
-        payload.slotNumber = selectedSlot.slotNumber;
-        payload.slotName = selectedSlot.name;
+
+    const payload: any = { records, branchId: currentBranch._id };
+    if (attendanceCount > 1 && selectedSlot) {
+      payload.slotNumber = selectedSlot.slotNumber;
+      payload.slotName = selectedSlot.name;
+    }
+
+    // -------- OFFLINE PATH --------
+    if (!isOnline) {
+      try {
+        await enqueue('attendance', currentBranch._id, payload);
+        Alert.alert(
+          t('teacher.attendance.alerts.savedTitle'),
+          'Saved offline — will sync automatically'
+        );
+        await fetchStudents();
+      } catch (e: any) {
+        Alert.alert(
+          t('teacher.attendance.errors.noBranchTitle'),
+          e?.message || t('teacher.attendance.errors.saveFailed')
+        );
+      } finally {
+        setSaving(false);
       }
+      return;
+    }
+
+    // -------- ONLINE PATH --------
+    try {
       await apiClient.post('/teacher/attendance/bulk', payload);
       Alert.alert(
         t('teacher.attendance.alerts.savedTitle'),
@@ -386,10 +412,20 @@ export const TeacherAttendanceScreen: React.FC = () => {
       );
       await fetchStudents();
     } catch (err: any) {
-      Alert.alert(
-        t('teacher.attendance.errors.noBranchTitle'),
-        err?.message || t('teacher.attendance.errors.saveFailed')
-      );
+      // Weak signal / timeout / server error → queue silently
+      try {
+        await enqueue('attendance', currentBranch._id, payload);
+        Alert.alert(
+          t('teacher.attendance.alerts.savedTitle'),
+          'Saved offline — will sync automatically'
+        );
+        await fetchStudents();
+      } catch (e: any) {
+        Alert.alert(
+          t('teacher.attendance.errors.noBranchTitle'),
+          err?.message || t('teacher.attendance.errors.saveFailed')
+        );
+      }
     } finally {
       setSaving(false);
     }
@@ -1112,3 +1148,5 @@ const styles = StyleSheet.create({
   },
   submitBtnText: { fontSize: 14, fontWeight: '700', color: '#fff' },
 });
+
+// await apiClient.post('/teacher/attendance/bulk', payload);

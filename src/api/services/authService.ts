@@ -73,15 +73,25 @@ export class AuthService extends BaseService {
    */
   async updateProfile(data: Partial<User>): Promise<User> {
     try {
-      const response = await this.api.put<ApiResponse<User>>(`${this.basePath}/profile`, data);
-      const updatedUser = this.handleResponse<User>(response);
+      const response: any = await this.api.put(`${this.basePath}/profile`, data);
 
-      const currentUser = await storage.getUser();
-      if (currentUser) {
-        await storage.storeUser({ ...currentUser, ...updatedUser });
-      }
+      // The backend returns either:
+      //   { message, user }         ← when updating
+      //   { ...user fields }        ← when returning the user directly
+      // Unwrap both shapes safely.
+      const payload = response?.user ?? response?.data?.user ?? response?.data ?? response;
 
-      return updatedUser;
+      const currentUser = (await storage.getUser()) || ({} as User);
+
+      // Merge: never let a missing field in the response wipe an existing field
+      const merged = { ...currentUser, ...(payload || {}) };
+
+      // Ensure _id is always present (response may use `id` instead)
+      if (!merged._id && payload?.id) merged._id = payload.id;
+
+      await storage.storeUser(merged);
+
+      return merged as User;
     } catch (error) {
       throw this.handleError(error);
     }
@@ -164,3 +174,5 @@ export class AuthService extends BaseService {
 }
 
 export const authService = new AuthService();
+
+// async updateProfile(data: Partial<User>): Promise<User> {

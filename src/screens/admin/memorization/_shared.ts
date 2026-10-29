@@ -23,6 +23,8 @@ export const COLORS = {
   redLight: '#FEE9E9',
   amber: '#D97706',
   amberLight: '#FEF3C7',
+  orange: '#EA580C',
+  orangeLight: '#FFEDD5',
   white: '#FFFFFF',
   slate: '#18392D',
   slateMuted: '#718079',
@@ -41,7 +43,10 @@ export type AchievementType =
   | 'ijazah'
   | 'subac'
   | 'book_review'
-  | 'tashiih';
+  | 'tashiih'
+  | 'reading_writing';
+
+export type GroupType = AchievementType;
 
 export interface Student {
   _id: string;
@@ -87,6 +92,20 @@ export interface Achievement {
   toBookPage?: number;
   topic?: string;
   topicComment?: string;
+  rwNote?: string;
+  // group
+  groupId?: string;
+  groupName?: string;
+  batchId?: string;
+  cycle?: number;
+  leader?: boolean;
+  externalLeader?: string;
+  // dot fields
+  fathi?: number[];
+  lahni?: number[];
+  tajwid?: number[];
+  ada?: number[];
+  behavior?: number[];
 }
 
 export interface AchievementFormState {
@@ -110,6 +129,31 @@ export interface AchievementFormState {
   comment: string;
   topic: string;
   customTopic: string;
+  rwNote: string;
+}
+
+// Group stored locally (like the web app)
+export interface SubacGroup {
+  id: string;
+  _id?: string;
+  name: string;
+  members: string[];
+  type: GroupType;
+  createdAt: string;
+  lastRange?: {
+    rangeType: 'surah' | 'juz';
+    fromSurah?: number;
+    fromAyah?: number;
+    toSurah?: number;
+    toAyah?: number;
+    fromJuz?: number;
+    fromQuarter?: number;
+    toJuz?: number;
+    toQuarter?: number;
+  };
+  // New optional fields returned by the server
+  halaqahId?: string;
+  halaqahName?: string;
 }
 
 // ============================================================
@@ -270,8 +314,6 @@ export const JUZ_NAMES: Record<number, { name: string; arabic: string }> = {
 
 // ============================================================
 // TASHIIH TOPICS
-// Arabic strings are used as backend IDs.
-// Use TASHIIH_TOPIC_KEYS to look up translation keys.
 // ============================================================
 export const TASHIIH_TOPICS = [
   'مخارج الحروف',
@@ -286,38 +328,65 @@ export const TASHIIH_TOPICS = [
   'Other',
 ];
 
-/**
- * Maps each Arabic TASHIIH topic (backend ID) to its translation key
- * under the `memorization.topics.*` namespace.
- */
 export const TASHIIH_TOPIC_KEYS: Record<string, string> = {
   'مخارج الحروف': 'memorization.topics.مخارج الحروف',
   'صفات الحروف': 'memorization.topics.صفات الحروف',
   'أحكام النون الساكنة': 'memorization.topics.أحكام النون الساكنة',
   'أحكام الميم الساكنة': 'memorization.topics.أحكام الميم الساكنة',
-  'القلقلة': 'memorization.topics.القلقلة',
+  القلقلة: 'memorization.topics.القلقلة',
   'أحكام المدود': 'memorization.topics.أحكام المدود',
   'أحكام الراء': 'memorization.topics.أحكام الراء',
   'تطبيق الحروف': 'memorization.topics.تطبيق الحروف',
   'تطبيق السورة': 'memorization.topics.تطبيق السورة',
-  'Other': 'memorization.topics.Other',
+  Other: 'memorization.topics.Other',
 };
 
-/**
- * Returns the translated label for a Tashiih topic.
- * Falls back to the raw Arabic string if `t` isn't provided.
- */
-export const getTopicLabel = (topic: string, t?: (key: string) => string) => {
+// ============================================================
+// READING & WRITING TOPICS
+// ============================================================
+export const READING_WRITING_TOPICS = [
+  'الحروف الهجائية',
+  'الحركات',
+  'السكون',
+  'التنوين',
+  'المدود',
+  'اللين',
+  'الشدة',
+  'اللامات',
+  'الهمزات',
+  'التاءات',
+  'التقاء الساكنين',
+  'Other',
+];
+
+export const READING_WRITING_TOPIC_KEYS: Record<string, string> = {
+  'الحروف الهجائية': 'memorization.rwTopics.الحروف الهجائية',
+  الحركات: 'memorization.rwTopics.الحركات',
+  السكون: 'memorization.rwTopics.السكون',
+  التنوين: 'memorization.rwTopics.التنوين',
+  المدود: 'memorization.rwTopics.المدود',
+  اللين: 'memorization.rwTopics.اللين',
+  الشدة: 'memorization.rwTopics.الشدة',
+  اللامات: 'memorization.rwTopics.اللامات',
+  الهمزات: 'memorization.rwTopics.الهمزات',
+  التاءات: 'memorization.rwTopics.التاءات',
+  'التقاء الساكنين': 'memorization.rwTopics.التقاء الساكنين',
+  Other: 'memorization.rwTopics.Other',
+};
+
+export const getTopicLabel = (
+  topic: string,
+  t?: (key: string) => string,
+  mode: 'tashiih' | 'rw' = 'tashiih'
+) => {
   if (!t) return topic;
-  const key = TASHIIH_TOPIC_KEYS[topic];
+  const map = mode === 'rw' ? READING_WRITING_TOPIC_KEYS : TASHIIH_TOPIC_KEYS;
+  const key = map[topic];
   return key ? t(key) : topic;
 };
 
 // ============================================================
 // ACHIEVEMENT TYPES
-// `labelKey` is a translation key (relative to the top-level
-// namespace, e.g. "memorization.types.memorization").
-// Translate at render time via getTypeInfo(type, t).
 // ============================================================
 export const ACHIEVEMENT_TYPES: {
   value: AchievementType;
@@ -375,6 +444,13 @@ export const ACHIEVEMENT_TYPES: {
     color: COLORS.teal,
     bg: COLORS.tealLight,
   },
+  {
+    value: 'reading_writing',
+    labelKey: 'memorization.types.reading_writing',
+    icon: 'create',
+    color: COLORS.orange,
+    bg: COLORS.orangeLight,
+  },
 ];
 
 // ============================================================
@@ -405,10 +481,6 @@ export const getJuzArabic = (id?: number) => {
   return JUZ_NAMES[id]?.arabic || '';
 };
 
-/**
- * Returns the achievement type metadata plus a translated `label`.
- * Pass `t` from useTranslation() at the call site.
- */
 export const getTypeInfo = (
   type: AchievementType,
   t?: (key: string) => string
@@ -421,10 +493,6 @@ export const getTypeInfo = (
   };
 };
 
-/**
- * Human-readable range string.
- * Pass `t` to translate units (Book, Pages, Lines, Verses, Unknown, Tashiih).
- */
 export const getRangeDisplay = (
   a: Achievement,
   t?: (key: string, opts?: any) => string
@@ -433,7 +501,14 @@ export const getRangeDisplay = (
     t ? t(key, opts) : fallback;
 
   if (a.type === 'tashiih') {
-    return a.topic ? getTopicLabel(a.topic, t) : tr('memorization.types.tashiih', 'Tashiih');
+    return a.topic
+      ? getTopicLabel(a.topic, t, 'tashiih')
+      : tr('memorization.types.tashiih', 'Tashiih');
+  }
+  if (a.type === 'reading_writing') {
+    return a.topic
+      ? getTopicLabel(a.topic, t, 'rw')
+      : tr('memorization.types.reading_writing', 'Reading and Writing');
   }
   if (a.type === 'book_review') {
     const unitFallback =
@@ -476,8 +551,111 @@ export const getStudentName = (
   t?: (key: string) => string
 ): string => {
   if (a.studentName) return a.studentName;
-  if (typeof a.studentId === 'object' && a.studentId?.name) return a.studentId.name;
+  if (typeof a.studentId === 'object' && a.studentId?.name)
+    return a.studentId.name;
   return t ? t('memorization.range.unknown') : 'Unknown';
+};
+
+// ============================================================
+// GROUPS — SERVER-BACKED
+// ============================================================
+// The web app used to store groups in localStorage. We now persist them
+// on the server so web + mobile see the same list.
+
+export const groupApi = {
+  /**
+   * GET /groups — list all active groups for the current tenant/branch.
+   * The server returns:
+   *   { id, _id, name, type, members: string[], membersData, halaqahId,
+   *     halaqahName, teacherId, teacherName, lastRange, createdAt, updatedAt }
+   */
+  list: async (): Promise<SubacGroup[]> => {
+    const res: any = await apiClient.get('/groups');
+    const list = Array.isArray(res) ? res : res?.groups || res?.data || [];
+    return list.map((g: any) => ({
+      id: String(g.id || g._id),
+      _id: g._id ? String(g._id) : undefined,
+      name: g.name,
+      type: (g.type || 'memorization') as GroupType,
+      members: (g.members || []).map((m: any) =>
+        typeof m === 'object' ? String(m._id) : String(m)
+      ),
+      createdAt: g.createdAt || new Date().toISOString(),
+      lastRange: g.lastRange || undefined,
+      halaqahId: g.halaqahId ? String(g.halaqahId) : undefined,
+      halaqahName: g.halaqahName || undefined,
+    }));
+  },
+
+  create: async (input: {
+    name: string;
+    type: GroupType;
+    members: string[];
+    halaqahId?: string;
+    halaqahName?: string;
+  }): Promise<SubacGroup> => {
+    const res: any = await apiClient.post('/groups', {
+      name: input.name,
+      type: input.type,
+      members: input.members,
+      halaqahId: input.halaqahId,
+      halaqahName: input.halaqahName,
+    });
+    const g = res?.group || res;
+    return {
+      id: String(g.id || g._id),
+      _id: g._id ? String(g._id) : undefined,
+      name: g.name,
+      type: (g.type || 'memorization') as GroupType,
+      members: (g.members || []).map((m: any) =>
+        typeof m === 'object' ? String(m._id) : String(m)
+      ),
+      createdAt: g.createdAt || new Date().toISOString(),
+      lastRange: g.lastRange || undefined,
+      halaqahId: g.halaqahId ? String(g.halaqahId) : undefined,
+      halaqahName: g.halaqahName || undefined,
+    };
+  },
+
+  update: async (
+    id: string,
+    input: {
+      name?: string;
+      type?: GroupType;
+      members?: string[];
+      halaqahId?: string;
+      halaqahName?: string;
+    }
+  ): Promise<SubacGroup> => {
+    const res: any = await apiClient.put(`/groups/${id}`, input);
+    const g = res?.group || res;
+    return {
+      id: String(g.id || g._id),
+      _id: g._id ? String(g._id) : undefined,
+      name: g.name,
+      type: (g.type || 'memorization') as GroupType,
+      members: (g.members || []).map((m: any) =>
+        typeof m === 'object' ? String(m._id) : String(m)
+      ),
+      createdAt: g.createdAt || new Date().toISOString(),
+      lastRange: g.lastRange || undefined,
+      halaqahId: g.halaqahId ? String(g.halaqahId) : undefined,
+      halaqahName: g.halaqahName || undefined,
+    };
+  },
+
+  remove: async (id: string): Promise<void> => {
+    await apiClient.delete(`/groups/${id}`);
+  },
+
+  /** Persist the last used range after a Subac session. */
+  updateLastRange: async (id: string, lastRange: SubacGroup['lastRange']) => {
+    try {
+      await apiClient.put(`/groups/${id}/last-range`, { lastRange });
+    } catch (e) {
+      console.warn('Failed to persist lastRange:', e);
+    }
+  },
 };
 
 // ============================================================
@@ -521,5 +699,94 @@ export const api = {
 
   deleteAchievement: async (id: string): Promise<void> => {
     await apiClient.delete(`/memorizations/${id}`);
+  },
+
+  // Books
+  getBooks: async (): Promise<any[]> => {
+    const res: any = await apiClient.get('/books').catch(() => []);
+    const list = Array.isArray(res) ? res : res?.books || res?.data || [];
+    return list;
+  },
+
+  createBook: async (payload: any): Promise<any> => {
+    const res: any = await apiClient.post('/books', payload);
+    return res?.book || res?.data || res;
+  },
+
+  deleteBook: async (id: string): Promise<void> => {
+    await apiClient.delete(`/books/${id}`);
+  },
+
+  // Achievements (single)
+  getStudentAchievements: async (
+    studentId: string,
+    params?: { limit?: number; date?: string }
+  ): Promise<Achievement[]> => {
+    const res: any = await apiClient.get(`/student/${studentId}/memorizations`, params);
+    return Array.isArray(res) ? res : res?.data || [];
+  },
+
+  // Last achievement per student (bulk)
+  getLastAchievements: async (
+    studentIds: string[]
+  ): Promise<Record<string, Achievement>> => {
+    if (!studentIds.length) return {};
+    try {
+      const res: any = await apiClient.get('/students/last-achievements', {
+        studentIds: studentIds.join(','),
+      });
+      return res || {};
+    } catch {
+      // Fallback: fetch individually in parallel
+      const entries = await Promise.all(
+        studentIds.map(async (id) => {
+          try {
+            const list = await api.getStudentAchievements(id, { limit: 1 });
+            return [id, list[0] || null] as const;
+          } catch {
+            return [id, null] as const;
+          }
+        })
+      );
+      const map: Record<string, Achievement> = {};
+      entries.forEach(([id, ach]) => {
+        if (ach) map[id] = ach;
+      });
+      return map;
+    }
+  },
+
+  // Top performers
+  getTopPerformers: async (params: {
+    startDate: string;
+    endDate: string;
+    type: string;
+    halaqahId?: string;
+    limit?: number;
+  }) => {
+    const q: any = {
+      startDate: params.startDate,
+      endDate: params.endDate,
+      type: params.type,
+      limit: params.limit || 20,
+    };
+    if (params.halaqahId) q.halaqahId = params.halaqahId;
+    const res: any = await apiClient.get('/memorizations/top-performers', q);
+    return Array.isArray(res) ? res : res?.data || [];
+  },
+
+  // Statistics
+  getStatistics: async (params: {
+    startDate: string;
+    endDate: string;
+    halaqahId?: string;
+  }) => {
+    const q: any = {
+      startDate: params.startDate,
+      endDate: params.endDate,
+    };
+    if (params.halaqahId) q.halaqahId = params.halaqahId;
+    const res: any = await apiClient.get('/statistics', q);
+    return res?.data || res || {};
   },
 };

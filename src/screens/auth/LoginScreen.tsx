@@ -1613,5 +1613,3 @@ const styles = StyleSheet.create({
 });
 
 export default LoginScreen;
-
-// madrasa
